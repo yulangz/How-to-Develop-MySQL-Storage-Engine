@@ -46,27 +46,68 @@
 #include "sql/handler.h" /* handler */
 #include "thr_lock.h"    /* THR_LOCK, THR_LOCK_DATA */
 
+#include "catalogue.h"
+#include "configuration.h"
+
+typedef std::vector<uint8_t> ByteVector;
+
 /** @brief
-  Example_share is a class that will be shared among all open handlers.
+  Sar_share is a class that will be shared among all open handlers.
   This sar implements the minimum of what you will probably need.
 */
-class Example_share : public Handler_share {
+class Sar_share : public Handler_share {
  public:
   THR_LOCK lock;
-  Example_share();
-  ~Example_share() { thr_lock_delete(&lock); }
+  Sar_share() { thr_lock_init(&lock); };
+  ~Sar_share() { thr_lock_delete(&lock); }
 };
 
 /** @brief
   Class definition for the storage engine
 */
 class ha_sar : public handler {
-  THR_LOCK_DATA lock;          ///< MySQL lock
-  Example_share *share;        ///< Shared lock info
-  Example_share *get_share();  ///< Get the share
+  // THR_LOCK_DATA lock;      ///< MySQL lock
+  Sar_share *share;        ///< Shared lock info
+  Sar_share *get_share();  ///< Get the share
+
+  // The (global) Database object; stores the upscaledb environment
+  Catalogue::Database *catdb;
+
+  // The Table object
+  Catalogue::Table *cattbl;
+
+  // Mutexes for locking (seem to be required)
+  THR_LOCK_DATA lock_data;
+
+  // A database cursor
+  ups_cursor_t *cursor;
+
+  // Is this the first call of |index_next_same()| after |position()|?
+  bool first_call_after_position;
+
+  // For caching the key in |position()|
+  ByteVector last_position_key;
+
+  // A memory buffer, to avoid frequent memory allocations
+  ByteVector key_arena;
+  ByteVector record_arena;
+
+  // For storing the record number id of a row
+  uint32_t recno_row_id;
+
+  // The index which reported a duplicate key
+  uint32_t duplicate_error_index; // 这个的作用是什么？
 
  public:
-  ha_sar(handlerton *hton, TABLE_SHARE *table_arg);
+  ha_sar(handlerton *hton, TABLE_SHARE *table_arg)
+      : handler(hton, table_arg),
+        catdb(nullptr),
+        cattbl(nullptr),
+        cursor(nullptr),
+        first_call_after_position(false),
+        recno_row_id(0),
+        duplicate_error_index(0) {
+  }
   ~ha_sar() {}
 
   /** @brief
@@ -81,10 +122,10 @@ class ha_sar : public handler {
     @sa handler::adjust_index_algorithm().
   */
   virtual enum ha_key_alg get_default_index_algorithm() const {
-    return HA_KEY_ALG_HASH;
+    return HA_KEY_ALG_BTREE;
   }
   virtual bool is_index_algorithm_supported(enum ha_key_alg key_alg) const {
-    return key_alg == HA_KEY_ALG_HASH;
+    return key_alg == HA_KEY_ALG_BTREE;
   }
 
   /** @brief
@@ -97,7 +138,15 @@ class ha_sar : public handler {
       an engine that can only handle statement-based logging. This is
       used in testing.
     */
-    return HA_BINLOG_STMT_CAPABLE;
+    return HA_NO_TRANSACTIONS      // TODO add transactions support
+           | HA_NO_AUTO_INCREMENT  // TODO add auto increment support
+           // | HA_MULTI_VALUED_KEY_SUPPORT  // TODO  do we need multi-valued
+           // key support?
+           | HA_TABLE_SCAN_ON_INDEX | HA_FAST_KEY_READ |
+           HA_REQUIRE_PRIMARY_KEY | HA_PRIMARY_KEY_IN_READ_INDEX |
+           HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
+           HA_PRIMARY_KEY_REQUIRED_FOR_DELETE | HA_HAS_OWN_BINLOGGING |
+           HA_BINLOG_FLAGS | HA_NO_READ_LOCAL_LOCK | HA_GENERATED_COLUMNS;
   }
 
   /** @brief
@@ -113,7 +162,7 @@ class ha_sar : public handler {
   ulong index_flags(uint inx MY_ATTRIBUTE((unused)),
                     uint part MY_ATTRIBUTE((unused)),
                     bool all_parts MY_ATTRIBUTE((unused))) const {
-    return 0;
+    return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE;
   }
 
   /** @brief
@@ -129,12 +178,15 @@ class ha_sar : public handler {
     unireg.cc will call this to make sure that the storage engine can handle
     the data it is about to send. Return *real* limits of your storage engine
     here; MySQL will do min(your_limits, MySQL_limits) automatically.
-
-      @details
-    There is no need to implement ..._key_... methods if your engine doesn't
-    support indexes.
    */
-  uint max_supported_keys() const { return 0; }
+  uint max_supported_keys() const { return MAX_KEY; }
+
+  /** @brief
+    unireg.cc will call this to make sure that the storage engine can handle
+    the data it is about to send. Return *real* limits of your storage engine
+    here; MySQL will do min(your_limits, MySQL_limits) automatically.
+   */
+  uint max_supported_key_parts() const { return MAX_REF_PARTS; }
 
   /** @brief
     unireg.cc will call this to make sure that the storage engine can handle
@@ -145,25 +197,14 @@ class ha_sar : public handler {
     There is no need to implement ..._key_... methods if your engine doesn't
     support indexes.
    */
-  uint max_supported_key_parts() const { return 0; }
-
-  /** @brief
-    unireg.cc will call this to make sure that the storage engine can handle
-    the data it is about to send. Return *real* limits of your storage engine
-    here; MySQL will do min(your_limits, MySQL_limits) automatically.
-
-      @details
-    There is no need to implement ..._key_... methods if your engine doesn't
-    support indexes.
-   */
-  uint max_supported_key_length() const { return 0; }
+  uint max_supported_key_length() const {
+    return std::numeric_limits<uint16_t>::max();
+  }
 
   /** @brief
     Called in test_quick_select to determine if indexes should be used.
   */
-  virtual double scan_time() {
-    return (double)(stats.records + stats.deleted) / 20.0 + 10;
-  }
+  virtual double scan_time() { return (double)(stats.records) / 20.0 + 10; }
 
   /** @brief
     This method will never be called if you do not implement indexes.
@@ -207,12 +248,22 @@ class ha_sar : public handler {
   */
   int delete_row(const uchar *buf);
 
-  /** @brief
-    We implement this in ha_sar.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
-  int index_read_map(uchar *buf, const uchar *key, key_part_map keypart_map,
-                     enum ha_rkey_function find_flag);
+  public:
+  int index_init(uint idx, bool sorted);
+  int index_end();
+
+  public:
+  virtual int index_read(uchar *buf, const uchar *key, uint key_len,
+                         enum ha_rkey_function find_flag);
+  int index_operation(uchar *keybuf, uint32_t keylen,
+                          uchar *buf, uint32_t flags);
+ public:
+//  /** @brief
+//    We implement this in ha_sar.cc. It's not an obligatory method;
+//    skip it and and MySQL will treat it as not implemented.
+//  */
+//  int index_read_map(uchar *buf, const uchar *key, key_part_map keypart_map,
+//                     enum ha_rkey_function find_flag);
 
   /** @brief
     We implement this in ha_sar.cc. It's not an obligatory method;
@@ -220,6 +271,10 @@ class ha_sar : public handler {
   */
   int index_next(uchar *buf);
 
+  public:
+  virtual int index_next_same(uchar *buf, const uchar *key, uint keylen);
+
+ public:
   /** @brief
     We implement this in ha_sar.cc. It's not an obligatory method;
     skip it and and MySQL will treat it as not implemented.
@@ -264,4 +319,6 @@ class ha_sar : public handler {
 
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type);  ///< required
+
+  int analyze(THD *, HA_CHECK_OPT *) { return HA_ADMIN_OK; };
 };
