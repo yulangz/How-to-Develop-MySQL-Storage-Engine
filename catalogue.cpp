@@ -8,165 +8,64 @@
 
 namespace Catalogue {
 
-boost::mutex databases_mutex;
-std::map<std::string, Database *> databases;
+EnvManager* env_manager;
 
-bool
-Table::add_config_value(std::string &key, std::string &value, bool is_open)
-{
-  if (key == "enable_compression") {
-    if (is_open == true)
-      return true;
-    if (value == "none")
-      return true;
-    if (value == "zlib") {
-      record_compression = UPS_COMPRESSOR_ZLIB;
-      return true;
-    }
-    if (value == "snappy") {
-      record_compression = UPS_COMPRESSOR_SNAPPY;
-      return true;
-    }
-    if (value == "lzf") {
-      record_compression = UPS_COMPRESSOR_LZF;
-      return true;
-    }
-    return false;
+boost::shared_ptr<Table> EnvManager::get_table_from_name(
+    const char *table_name) {
+  auto table_iter = Catalogue::env_manager->table_map.find(table_name);
+  if (unlikely(table_iter == Catalogue::env_manager->table_map.end())) {
+    return nullptr;
   }
 
-  return false;
+  return table_iter->second;
 }
 
-bool
-Database::add_config_value(std::string &key, std::string &value, bool is_open)
-{
-  if (key == "enable_crc32") {
-    if (value == "true") {
-      flags |= UPS_ENABLE_CRC32;
-      return true;
-    }
-    if (value == "false")
-      return true;
-    return false;
+ups_status_t EnvManager::free_table(const char *table_name) {
+  ups_status_t st;
+
+  auto table = get_table_from_name(table_name);
+  if (unlikely(table == nullptr)) {
+    sql_print_error("Table %s not found", table_name);
+    return UPS_DATABASE_NOT_FOUND;
   }
 
-  if (key == "disable_recovery") {
-    if (value == "true") {
-      flags |= UPS_DISABLE_RECOVERY;
-      return true;
+  for (auto &index : table->indices) {
+    uint16_t dbname = ups_db_get_name(index.db);
+    st = ups_env_erase_db(env, dbname, 0);
+    if (unlikely(st != 0)) {
+      log_error("ups_env_erase_db", st);
+      return st;
     }
-    if (value == "false")
-      return true;
-    return false;
+    dbName_tracker.free_dbname(dbname);
   }
 
-  if (key == "enable_server") {
-    if (value == "true") {
-      is_server_enabled = true;
-      return true;
-    }
-    if (value == "false") {
-      is_server_enabled = false;
-      return true;
-    }
-    return false;
-  }
-
-  if (key == "server_port") {
-    try {
-      server_port = boost::lexical_cast<uint16_t>(value);
-      return true;
-    }
-    catch (boost::bad_lexical_cast &) {
-      return false;
-    }
-  }
-
-  if (key == "cache_size") {
-    if (value == "unlimited") {
-      flags |= UPS_CACHE_UNLIMITED;
-      return true;
-    }
-    try {
-      ups_parameter_t p = {UPS_PARAM_CACHE_SIZE,
-                           boost::lexical_cast<uint32_t>(value)};
-      params.push_back(p);
-      return true;
-    }
-    catch (boost::bad_lexical_cast &) {
-      return false;
-    }
-  }
-
-  if (key == "page_size") {
-    if (is_open)
-      return true;
-
-    try {
-      ups_parameter_t p = {UPS_PARAM_PAGE_SIZE,
-                           boost::lexical_cast<uint32_t>(value)};
-      params.push_back(p);
-      return true;
-    }
-    catch (boost::bad_lexical_cast &) {
-      return false;
-    }
-  }
-
-  if (key == "file_size_limit") {
-    try {
-      ups_parameter_t p = {UPS_PARAM_FILE_SIZE_LIMIT,
-                           boost::lexical_cast<uint32_t>(value)};
-      params.push_back(p);
-      return true;
-    }
-    catch (boost::bad_lexical_cast &) {
-      return false;
-    }
-  }
-
-  // still here? Check if this setting is for one of the tables ($table.key)
-  size_t pos = key.find(".");
-  if (pos != std::string::npos) {
-    std::string table_name(&key[0], &key[pos]);
-    key = key.substr(pos + 1);
-
-    // Create a table object if it does not yet exist
-    Table *cattbl = tables[table_name];
-    if (!cattbl) {
-      cattbl = new Table(table_name);
-      tables[table_name] = cattbl;
-    }
-
-    return cattbl->add_config_value(key, value, is_open);
-  }
-
-  return false;
+  table_map.erase(table_name);
+  return 0;
 }
 
-void
-Database::finalize_config()
-{
-  // no cache size specified? then set the default (128 mb)
-  bool found = false;
-  for (std::vector<ups_parameter_t>::iterator it = params.begin();
-       it != params.end(); ++it) {
-    if (it->name == UPS_PARAM_CACHE_SIZE) {
-      found = true;
-      break;
-    }
-  }
-  if (!found) {
-    ups_parameter_t p = {UPS_PARAM_CACHE_SIZE, kDefaultCacheSize};
-    params.push_back(p);
-  }
+DBNameTracker::DBNameTracker(uint16_t size) : name_track(size, 0) {}
 
-  if (!(flags & UPS_DISABLE_RECOVERY))
-    flags |= UPS_AUTO_RECOVERY;
+void DBNameTracker::reset() { name_track.reset(); }
 
-  // add the "terminating" element
-  ups_parameter_t p = {0, 0};
-  params.push_back(p);
+void DBNameTracker::assign(uint16_t *names, uint32_t length) {
+  for (uint32_t i = system_db_name + 1; i < length; ++i) {
+    name_track.set(names[i]);
+  }
 }
 
-} // namespace Catalogue
+uint16_t DBNameTracker::get_new_dbname() {
+  auto l = (int32_t)name_track.size();
+  for (int32_t i = system_db_name + 1; i < l; ++i) {
+    if (!name_track.test(i)) {
+      name_track.set(i);
+      return i;
+    }
+  }
+  return 0;
+}
+
+void DBNameTracker::free_dbname(uint16_t dbname) {
+  DBUG_ASSERT(name_track.test(dbname));
+  name_track.reset(dbname);
+}
+}  // namespace Catalogue

@@ -105,213 +105,52 @@
 
 #include <boost/filesystem.hpp>
 
-// helper macros to improve CPU branch prediction
-#if defined __GNUC__
-#define likely(x) __builtin_expect((x), 1)
-#define unlikely(x) __builtin_expect((x), 0)
+#ifdef REMOTE
+// TODO 用Mysql SysVar
+#define UPS_ENV_NAME "ups://localhost:8085/env.db"
+#define UPS_ENV_MODE 0
 #else
-#define likely(x) (x)
-#define unlikely(x) (x)
+#define UPS_ENV_NAME "env.db"
+#define UPS_ENV_MODE 0644
 #endif
 
-#define CUSTOM_COMPARE_NAME "varlencmp"
+// #define CUSTOM_COMPARE_NAME "varlencmp"
 
-struct KeyPart {
-  KeyPart(uint32_t type_ = 0, uint32_t length_ = 0)
-      : type(type_), length(length_) {}
+///////////////////////////////////////////////////////////
+// Globals
+///////////////////////////////////////////////////////////
+static handlerton *sar_hton;
 
-  uint32_t type;
-  uint32_t length;
-};
-
-// 提取key中的key_part信息，应该是包括key的类型和长度
-struct CustomCompareState {
-  CustomCompareState(KEY *key) {
-    if (key) {
-      for (uint32_t i = 0; i < key->user_defined_key_parts; i++) {
-        KEY_PART_INFO *key_part = &key->key_part[i];
-        parts.emplace_back(key_part->type, key_part->length);
-      }
-    }
-  }
-
-  std::vector<KeyPart> parts;
-};
-
-// 返回一个type类型的field的前缀长度
-static inline int encoded_length_bytes(uint32_t type) {
-  if (type == HA_KEYTYPE_VARTEXT1 || type == HA_KEYTYPE_VARBINARY1) return 1;
-  if (type == HA_KEYTYPE_VARTEXT2 || type == HA_KEYTYPE_VARBINARY2) return 2;
-  return 0;
+static ups_txn_t *get_tx_from_thd(THD *const thd) {
+  return reinterpret_cast<ups_txn_t *>(thd_get_ha_data(thd, sar_hton));
 }
 
-static TABLE *recovery_table;  // TODO 干啥用的？
+__attribute__((unused)) static ups_txn_t *get_or_create_tx(THD *const thd) {
+  thd_set_ha_data(thd, sar_hton, nullptr);  // TODO 现在先不支持事务
 
-// 自定义的比较函数，按照key_part中的顺序依次比较各个key，按字面值进行比较，可以兼容变长字段
-static int custom_compare_func(ups_db_t *db, const uint8_t *lhs,
-                               uint32_t lhs_length, const uint8_t *rhs,
-                               uint32_t rhs_length) {
-  CustomCompareState *ccs = (CustomCompareState *)ups_get_context_data(db, 1);
-  CustomCompareState tmp_ccs(
-      ccs != nullptr ? nullptr
-                     : &recovery_table->key_info[ups_db_get_name(db) - 2]);
-  // during recovery, the context pointer was not yet installed. in this case
-  // we use the temporary one.
-  if (ccs == nullptr) ccs = &tmp_ccs;
-
-  for (size_t i = 0; i < ccs->parts.size(); i++) {
-    KeyPart *key_part = &ccs->parts[i];
-
-    int cmp;
-
-    // TODO use *real* comparison function for other columns like uint32,
-    // float, ...?
-    switch (encoded_length_bytes(key_part->type)) {
-      case 0:  // fixed length columns
-        cmp = ::memcmp(lhs, rhs, key_part->length);
-        lhs_length = key_part->length;
-        rhs_length = key_part->length;
-        break;
-      case 1:
-        lhs_length = *lhs;
-        lhs += 1;
-        rhs_length = *rhs;
-        rhs += 1;
-        cmp = ::memcmp(lhs, rhs, std::min(lhs_length, rhs_length));
-        break;
-      case 2:
-        lhs_length = *(uint16_t *)lhs;
-        lhs += 2;
-        rhs_length = *(uint16_t *)rhs;
-        rhs += 2;
-        cmp = ::memcmp(lhs, rhs, std::min(lhs_length, rhs_length));
-        break;
-      default:
-        assert(!"shouldn't be here");
-    }
-
-    if (cmp != 0) return cmp;
-    // cmp == 0
-    if (lhs_length < rhs_length) return -1;
-    if (lhs_length > rhs_length) return +1;
-
-    // both keys are equal - continue with the next one
-    lhs += lhs_length;
-    rhs += rhs_length;
+  ups_txn_t *tx = get_tx_from_thd(thd);
+  if (tx == nullptr) {
+    // create and start tx
+    thd_set_ha_data(thd, sar_hton, tx);
+  } else {
+    // start tx
   }
 
-  // still here? then both keys must be equal
-  return 0;
+  return tx;
 }
 
-static void log_error_impl(const char *file, int line, const char *function,
-                           ups_status_t st) {
-  sql_print_error("%s[%d] %s: failed with error %d (%s)", file, line, function,
-                  st, ups_strerror(st));
+static inline KEY* get_key_info(TABLE* table, int idx) {
+  return &(table->key_info[idx]);
 }
 
-#define log_error(f, s) log_error_impl(__FILE__, __LINE__, f, s)
-
-// A class which aborts a transaction when it's destructed
-struct TxnProxy {
-  TxnProxy(ups_env_t *env) {
-    ups_status_t st = ups_txn_begin(&txn, env, 0, 0, 0);
-    if (unlikely(st != 0)) {
-      log_error("ups_txn_begin", st);
-      txn = nullptr;
-    }
-  }
-
-  ~TxnProxy() {
-    if (txn != nullptr) {
-      ups_status_t st = ups_txn_abort(txn, 0);
-      if (unlikely(st != 0)) log_error("ups_txn_abort", st);
-    }
-  }
-
-  ups_status_t commit() {
-    ups_status_t st = ups_txn_commit(txn, 0);
-    if (likely(st == 0)) txn = nullptr;
-    return st;
-  }
-
-  ups_status_t abort() {
-    if (txn != nullptr) {
-      ups_status_t st = ups_txn_abort(txn, 0);
-      if (likely(st == 0)) txn = nullptr;
-      return st;
-    }
-    return 0;
-  }
-
-  ups_txn_t *txn;
-};
-
-// A class which closes a cursor when going out of scope
-struct CursorProxy {
-  CursorProxy(ups_cursor_t *c = nullptr) : cursor(c) {}
-
-  CursorProxy(ups_db_t *db, ups_txn_t *txn = nullptr) {
-    ups_status_t st = ups_cursor_create(&cursor, db, txn, 0);
-    if (unlikely(st != 0)) {
-      log_error("ups_cursor_create", st);
-      cursor = nullptr;
-    }
-  }
-
-  ~CursorProxy() {
-    if (cursor != nullptr) {
-      ups_status_t st = ups_cursor_close(cursor);
-      if (unlikely(st != 0)) log_error("ups_cursor_close", st);
-    }
-  }
-
-  ups_cursor_t *detach() {
-    ups_cursor_t *c = cursor;
-    cursor = nullptr;
-    return c;
-  }
-
-  ups_cursor_t *cursor;
-};
-
-static inline std::string format_environment_name(const char *name) {
-  std::string n(name);
-  return n + ".ups";
+static inline bool key_enable_duplicates(KEY * key_info) {
+  return !(key_info->actual_flags & HA_NOSAME);
 }
-
-// 删除一个Mysql表，以及与之相关的Catalogue::Database
-static inline void close_and_remove_share(const char *table_name,
-                                          Catalogue::Database *catdb) {
-  boost::mutex::scoped_lock lock(Catalogue::databases_mutex);
-  ups_env_t *env = catdb ? catdb->env : nullptr;
-  ups_srv_t *srv = catdb ? catdb->srv : nullptr;
-
-  // also remove the environment from a server
-  if (env && srv) (void)ups_srv_remove_env(srv, env);
-
-  // close the environment
-  if (env) {
-    ups_status_t st = ups_env_close(env, UPS_AUTO_CLEANUP);
-    if (unlikely(st != 0)) log_error("ups_env_close", st);
-    catdb->env = nullptr;
-  }
-
-  // TODO TODO TODO
-  std::string env_name = format_environment_name(table_name);
-  if (Catalogue::databases.find(env_name) != Catalogue::databases.end())
-    Catalogue::databases.erase(Catalogue::databases.find(env_name));
-}
-
-//////////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////////////
 
 static handler *sar_create_handler(handlerton *hton, TABLE_SHARE *table, bool,
                                    MEM_ROOT *mem_root) {
   return new (mem_root) ha_sar(hton, table);
 }
-
-// handlerton *sar_hton; // TODO 是否需要？
 
 /* Interface to mysqld, to check system tables supported by SE */
 static bool sar_is_supported_system_table(const char *db,
@@ -321,7 +160,43 @@ static bool sar_is_supported_system_table(const char *db,
 static int sar_init_func(void *p) {
   DBUG_ENTER("sar_init_func");
 
-  handlerton *sar_hton = (handlerton *)p;
+  ups_env_t *env;
+  ups_status_t st;
+  ups_parameter_t params[] = {{0, 0}, {0, 0}, {0, 0}, {0, 0},
+                              {0, 0}, {0, 0}, {0, 0}, {0, 0}};
+  uint32_t flag = 0;
+  // ups_register_compare(CUSTOM_COMPARE_NAME, custom_compare_func);
+
+  flag |= UPS_ENABLE_TRANSACTIONS;
+  //  flag |= UPS_DISABLE_RECOVERY;
+  //  flag |= UPS_CACHE_UNLIMITED;
+  //  flag |= UPS_IN_MEMORY;
+  //  flag |= UPS_DISABLE_MMAP;
+  // DBUG_ASSERT(params[7].name == 0 && params[7].value == 0);
+
+#ifdef REMOTE
+  st = ups_env_open(&env, UPS_ENV_NAME, flag, params);
+#else
+  st = ups_env_open(&env, UPS_ENV_NAME, flag, params);
+  if (st == UPS_FILE_NOT_FOUND)
+    st = ups_env_create(&env, UPS_ENV_NAME, flag, UPS_ENV_MODE, params);
+#endif
+
+  if (st != UPS_SUCCESS) {
+    log_error("ups_env_create", st);
+    DBUG_RETURN(1);
+  }
+
+  params[0] = {UPS_PARAM_MAX_DATABASES, 0};
+  params[1] = {0, 0};
+  ups_env_get_parameters(env, params);
+  auto max_databases = (uint16_t)params[0].value;
+
+  Catalogue::env_manager = new Catalogue::EnvManager(env, max_databases);
+
+  // TODO connect and open all table
+
+  sar_hton = (handlerton *)p;
   sar_hton->state = SHOW_OPTION_YES;
   sar_hton->create = sar_create_handler;
   sar_hton->flags =
@@ -334,359 +209,16 @@ static int sar_init_func(void *p) {
   DBUG_RETURN(0);
 }
 
-// 返回一个key_part(一个field)在upsdb中的类型，以及字节大小
-static inline std::pair<uint32_t, uint32_t>  // <key, size>
-table_field_info(KEY_PART_INFO *key_part) {
-  Field *field = key_part->field;
-  Field_temporal *f;
-
-  // 我对引擎设置了不支持NULL，所以这里应该不需要了
-  // if key can be null: use a variable-length key
-  if (key_part->null_bit)
-    return std::make_pair((uint32_t)UPS_TYPE_BINARY, UPS_KEY_SIZE_UNLIMITED);
-
-  switch (field->type()) {
-    case MYSQL_TYPE_TINY:
-    case MYSQL_TYPE_YEAR:
-      return std::make_pair((uint32_t)UPS_TYPE_UINT8, 1u);
-    case MYSQL_TYPE_SHORT:
-      return std::make_pair((uint32_t)UPS_TYPE_UINT16, 2u);
-    case MYSQL_TYPE_LONG:
-      return std::make_pair((uint32_t)UPS_TYPE_UINT32, 4u);
-    case MYSQL_TYPE_LONGLONG:
-      return std::make_pair((uint32_t)UPS_TYPE_UINT64, 8u);
-    case MYSQL_TYPE_FLOAT:
-      return std::make_pair((uint32_t)UPS_TYPE_REAL32, 4u);
-    case MYSQL_TYPE_DOUBLE:
-      return std::make_pair((uint32_t)UPS_TYPE_REAL64, 8u);
-    case MYSQL_TYPE_DATE:
-      return std::make_pair((uint32_t)UPS_TYPE_BINARY, 3u);
-    case MYSQL_TYPE_TIME:
-      f = (Field_temporal *)field;
-      return std::make_pair((uint32_t)UPS_TYPE_BINARY, 3u + f->decimals());
-    case MYSQL_TYPE_DATETIME:
-      f = (Field_temporal *)field;
-      return std::make_pair((uint32_t)UPS_TYPE_BINARY, 5u + f->decimals());
-    case MYSQL_TYPE_TIMESTAMP:
-      f = (Field_temporal *)field;
-      return std::make_pair((uint32_t)UPS_TYPE_BINARY, 4u + f->decimals());
-    case MYSQL_TYPE_SET:
-      return std::make_pair((uint32_t)UPS_TYPE_BINARY, field->pack_length());
-    default:
-      break;
-  }
-
-  // includes ENUM, CHAR, BINARY...
-  // For multi-part keys we return the length that is required to store the
-  // full column. For single-part keys we only store the actually used
-  // length.
-  switch (key_part->type) {
-    case HA_KEYTYPE_BINARY:
-    case HA_KEYTYPE_TEXT:
-      return std::make_pair((uint32_t)UPS_TYPE_BINARY, key_part->length);
-    case HA_KEYTYPE_VARTEXT1:
-    case HA_KEYTYPE_VARTEXT2:
-    case HA_KEYTYPE_VARBINARY1:
-    case HA_KEYTYPE_VARBINARY2:
-      return std::make_pair((uint32_t)UPS_TYPE_BINARY, 0);  // TODO 为什么是0?
-  }
-
-  return std::make_pair((uint32_t)UPS_TYPE_BINARY, 0u);
+static int sar_uninstall_func(void *p __attribute__ ((unused))) {
+  DBUG_ENTER("sar_uninstall_func");
+  Catalogue::env_manager->lock.lock();
+  ups_env_t *env = Catalogue::env_manager->env;
+  Catalogue::env_manager->lock.unlock();
+  delete Catalogue::env_manager;
+  Catalogue::env_manager = nullptr;
+  ups_env_close(env, 0);
+  DBUG_RETURN(0);
 }
-
-// 返回一个KEY在upsdb中的类型，以及字节大小，一个KEY可以包含多个key_part(field)，要全部累计起来
-static inline std::pair<uint32_t, uint32_t>  // <key, size>
-table_key_info(KEY *key_info) {
-  // if this index is made from a single column: return type/size of this column
-  if (key_info->user_defined_key_parts == 1)
-    return table_field_info(key_info->key_part);
-
-  // Otherwise accumulate the total size of all columns which form this
-  // key.
-  // If any key has variable length then we need to use our custom compare
-  // function.
-  uint32_t total_size = 0;
-  bool need_custom_compare = false;
-  for (uint32_t i = 0; i < key_info->user_defined_key_parts; i++) {
-    std::pair<uint32_t, uint32_t> p = table_field_info(&key_info->key_part[i]);
-    if (total_size == UPS_KEY_SIZE_UNLIMITED || p.second == 0 ||
-        p.second == UPS_KEY_SIZE_UNLIMITED)
-      total_size = UPS_KEY_SIZE_UNLIMITED;
-    else
-      total_size += p.second;
-
-    switch (key_info->key_part[i].type) {
-      case HA_KEYTYPE_VARTEXT1:
-      case HA_KEYTYPE_VARTEXT2:
-      case HA_KEYTYPE_VARBINARY1:
-      case HA_KEYTYPE_VARBINARY2:
-        need_custom_compare = true;
-    }
-  }
-
-  return std::make_pair(need_custom_compare ? UPS_TYPE_CUSTOM : UPS_TYPE_BINARY,
-                        total_size);
-}
-
-// 从一个行数据中提取出一个key_part(field)的数据，生成ups_key_t，TODO 改名
-static inline ups_key_t key_from_single_row(TABLE *, const uchar *buf,
-                                            KEY_PART_INFO *key_part) {
-  uint16_t key_size = (uint16_t)key_part->length;
-  uint32_t offset = key_part->offset;
-
-  switch (encoded_length_bytes(key_part->type)) {
-    case 1:
-      key_size = buf[offset];
-      offset++;
-      key_size = std::min(key_size, key_part->length);
-      break;
-    case 2:
-      key_size = *(uint16_t *)&buf[offset];
-      offset += 2;
-      key_size = std::min(key_size, key_part->length);
-      break;
-  }
-
-  ups_key_t key = ups_make_key((uchar *)buf + offset, key_size);
-  return key;
-}
-
-// buf指向一个行，提取其中第index个KEY(可能包含多个Field)的值，生成ups_key_t
-static inline ups_key_t key_from_row(TABLE *table, const uchar *buf, int index,
-                                     ByteVector &arena) {
-  arena.clear();
-
-  if (likely(table->key_info[index].user_defined_key_parts == 1))
-    return key_from_single_row(table, buf, table->key_info[index].key_part);
-
-  arena.clear();
-  for (uint32_t i = 0; i < table->key_info[index].user_defined_key_parts; i++) {
-    KEY_PART_INFO *key_part = &table->key_info[index].key_part[i];
-    uint16_t key_size = (uint16_t)key_part->length;
-    uint8_t *p = (uint8_t *)buf + key_part->offset;
-
-    switch (encoded_length_bytes(key_part->type)) {
-      case 1:
-        key_size = *p;
-        arena.insert(arena.end(), p, p + 1);
-        p += 1;
-        break;
-      case 2:
-        key_size = *(uint16_t *)p;
-        arena.insert(arena.end(), p, p + 2);
-        p += 2;
-        break;
-      case 0:  // fixed length columns
-        arena.insert(arena.end(), p, p + key_size);
-        continue;
-      default:
-        assert(!"shouldn't be here");
-    }
-
-    // append the data to our memory buffer
-    // BLOB/TEXT data is encoded as a "pointer-to-pointer" in the stream
-    if ((key_part->key_part_flag & HA_VAR_LENGTH_PART) == 0)
-      p = *(uint8_t **)p;  // p原来指向的是一个指针，现在指向那个指针指向的值
-    arena.insert(arena.end(), p, p + key_size);
-  }
-
-  ups_key_t key = ups_make_key(arena.data(), (uint16_t)arena.size());
-  return key;
-}
-
-static inline bool row_is_fixed_length(TABLE *table) {
-  // table->s里面保存的是一个Table不变的一些信息
-  return table->s->blob_fields + table->s->varchar_fields == 0;
-}
-
-// 提取varchar字段的长度信息，保存在len_bytes里面
-static inline void extract_varchar_field_info(Field *field, uint32_t *len_bytes,
-                                              uint32_t *field_size,
-                                              const uint8_t *src) {
-  // see Field_blob::Field_blob() (in field.h) - need 1-4 bytes to
-  // store the real size
-  if (likely(field->field_length <= 255)) {
-    *field_size = *src;
-    *len_bytes = 1;
-    return;
-  }
-  if (likely(field->field_length <= 65535)) {
-    *field_size = *(uint16_t *)src;
-    *len_bytes = 2;
-    return;
-  }
-  if (likely(field->field_length <= 16777215)) {
-    *field_size = (src[2] << 16) | (src[1] << 8) | (src[0] << 0);
-    *len_bytes = 3;
-    return;
-  }
-  *field_size = *(uint32_t *)src;
-  *len_bytes = 4;
-}
-
-// 把upsdb的record转换成为Mysql的row，只有Row中包含变长字段的时候才需要
-static inline ups_record_t unpack_record(TABLE *table, ups_record_t *record,
-                                         uint8_t *buf) {
-  assert(!row_is_fixed_length(table));
-
-  uint8_t *src = (uint8_t *)record->data;
-  uint8_t *dst = buf;
-
-  // copy the "null bytes" descriptors
-  for (uint32_t i = 0; i < table->s->null_bytes; i++) {
-    *dst = *src;
-    dst++;
-    src++;
-  }
-
-  uint32_t i = 0;
-  for (Field **field = table->field; *field != nullptr; field++, i++) {
-    uint32_t size;
-    uint32_t type = (*field)->type();
-
-    if (type == MYSQL_TYPE_VARCHAR) {
-      uint32_t len_bytes;
-      extract_varchar_field_info(*field, &len_bytes, &size, src);
-      ::memcpy(dst, src, size + len_bytes);
-      if (likely((*field)->pack_length() > size + len_bytes))
-        ::memset(dst + size + len_bytes, 0,
-                 (*field)->pack_length() - (size + len_bytes));
-      dst += (*field)->pack_length();
-      src += size + len_bytes;
-      continue;
-    }
-
-    if (type == MYSQL_TYPE_TINY_BLOB || type == MYSQL_TYPE_BLOB ||
-        type == MYSQL_TYPE_MEDIUM_BLOB || type == MYSQL_TYPE_LONG_BLOB) {
-      size = *(uint32_t *)src;
-      src += sizeof(uint32_t);
-      Field_blob *blob = *(Field_blob **)field;
-      switch (blob->pack_length() - 8) {
-        case 1:
-          *dst = (uint8_t)size;
-          break;
-        case 2:
-          *(uint16_t *)dst = (uint16_t)size;
-          break;
-        case 3:  // TODO not yet tested...
-          dst[2] = (size & 0xff0000) >> 16;
-          dst[1] = (size & 0xff00) >> 8;
-          dst[0] = (size & 0xff);
-          break;
-        case 4:
-          *(uint32_t *)dst = size;
-          break;
-        case 8:
-          *(uint64_t *)dst = size;
-          break;
-        default:
-          assert(!"not yet implemented");
-          break;
-      }
-
-      dst += (*field)->pack_length() - 8;
-      *(uint8_t **)dst = src;
-      src += size;
-      dst += sizeof(uint8_t *);
-      continue;
-    }
-
-    size = (*field)->pack_length();
-    ::memcpy(dst, src, size);
-    src += size;
-    dst += size;
-  }
-
-  ups_record_t r = ups_make_record(buf, (uint32_t)(dst - buf));
-  return r;
-}
-
-// 把Mysql的row转换成为upsdb的record，只有Row中包含变长字段的时候才需要
-static inline ups_record_t pack_record(TABLE *table, uint8_t *buf,
-                                       ByteVector &arena) {
-  assert(!row_is_fixed_length(table));
-
-  uint8_t *src = buf;
-  arena.clear();
-  arena.reserve(1024);
-  uint8_t *dst = arena.data();
-
-  // copy the "null bytes" descriptors
-  arena.resize(table->s->null_bytes);
-  for (uint32_t i = 0; i < table->s->null_bytes; i++) {
-    *dst = *src;
-    dst++;
-    src++;
-  }
-
-  for (Field **field = table->field; *field != nullptr; field++) {
-    uint32_t size;
-    uint32_t type = (*field)->type();
-
-    if (type == MYSQL_TYPE_VARCHAR) {
-      uint32_t len_bytes;
-      extract_varchar_field_info(*field, &len_bytes, &size, src);
-
-      // make sure we have sufficient space
-      uint32_t pos = dst - arena.data();
-      arena.resize(arena.size() + size + len_bytes);
-      dst = &arena[pos];
-
-      ::memcpy(dst, src, size + len_bytes);
-      src += (*field)->pack_length();
-      dst += size + len_bytes;
-      continue;
-    }
-
-    if (type == MYSQL_TYPE_TINY_BLOB || type == MYSQL_TYPE_BLOB ||
-        type == MYSQL_TYPE_MEDIUM_BLOB || type == MYSQL_TYPE_LONG_BLOB) {
-      uint32_t packlength;
-      uint32_t length;
-      extract_varchar_field_info(*field, &packlength, &length, src);
-
-      // make sure we have sufficient space
-      uint32_t pos = dst - arena.data();
-      arena.resize(arena.size() + sizeof(uint32_t) + length);
-      dst = &arena[pos];
-
-      *(uint32_t *)dst = length;
-      dst += sizeof(uint32_t);
-      ::memcpy(dst, *(char **)(src + packlength), length);
-      dst += length;
-      src += packlength + sizeof(void *);
-      continue;
-    }
-
-    size = (*field)->key_length();
-
-    // make sure we have sufficient space
-    uint32_t pos = dst - arena.data();
-    arena.resize(arena.size() + size);
-    dst = &arena[pos];
-
-    ::memcpy(dst, src, size);
-    src += size;
-    dst += size;
-  }
-
-  ups_record_t r = ups_make_record(arena.data(), (uint32_t)(dst - &arena[0]));
-  return r;
-}
-
-// 把Mysql的row转换成为upsdb的record，会把buf中的内容copy到arena中
-static inline ups_record_t record_from_row(TABLE *table, uint8_t *buf,
-                                           ByteVector &arena) {
-  // fixed length rows do not need any packing
-  if (row_is_fixed_length(table)) {
-    return ups_make_record(buf, (uint32_t)table->s->stored_rec_length);
-  }
-
-  // but if rows have variable length (i.e. due to a VARCHAR field) we
-  // pack them to save space
-  return pack_record(table, buf, arena);
-}
-
-static inline uint16_t dbname(int index) { return index + 2; }
 
 // key是否存在于db中
 static inline bool key_exists(ups_db_t *db, ups_key_t *key) {
@@ -695,103 +227,68 @@ static inline bool key_exists(ups_db_t *db, ups_key_t *key) {
   return st == 0;
 }
 
-// 初始化自增Key，db是这个Key对应upsdb的db
-static inline uint64_t initialize_autoinc(KEY_PART_INFO *key_part,
-                                          ups_db_t *db) {
-  // if the database is not empty: read the maximum value
-  if (db) {
-    CursorProxy cp(db, nullptr);
-    if (unlikely(cp.cursor == nullptr)) return 0;
-
-    ups_key_t key = ups_make_key(nullptr, 0);
-    ups_status_t st =
-        ups_cursor_move(cp.cursor, &key, nullptr, UPS_CURSOR_LAST);
-    if (st == 0) {
-      uint8_t *p = (uint8_t *)key.data;
-      // the auto-increment key is always at the beginning of |p|
-      if (key_part->length == 1) return *p;
-      if (key_part->length == 2) return *(uint16_t *)p;
-      if (key_part->length == 3) return (p[0] << 16) | (p[1] << 8) | p[0];
-      if (key_part->length == 4) return *(uint32_t *)p;
-      if (key_part->length == 8) return *(uint64_t *)p;
-      assert(!"shouldn't be here");
-      return 0;
-    }
-  }
-
-  return 0;
+// 删除一张Mysql表，删除upsdb中与这张表相关的全部内容，最后从env_manager内将其删除
+static ups_status_t delete_mysql_table(const char *table_name) {
+  boost::mutex::scoped_lock l(Catalogue::env_manager->lock);
+  return Catalogue::env_manager->free_table(table_name);
 }
 
-// 删除一张Mysql表，删除upsdb中与这张表相关的全部内容
-static ups_status_t delete_all_databases(Catalogue::Database *catdb,
-                                         Catalogue::Table *cattbl,
-                                         TABLE *) {
-  ups_status_t st;
-  uint16_t names[1024];
-  uint32_t length = 1024;
-  st = ups_env_get_database_names(catdb->env, names, &length);
-  if (unlikely(st)) {
-    log_error("ups_env_get_database_names", st);
-    return 1;
-  }
+// 创建一张Mysql表，创建upsdb中与这张表相关的全部内容，并把这张表添加到env_manager内
+static ups_status_t create_mysql_table(const char *table_name, TABLE *table) {
+  boost::mutex::scoped_lock lock(Catalogue::env_manager->lock);
 
-  if (cattbl->autoidx.db) {
-    ups_db_close(cattbl->autoidx.db, 0);
-    cattbl->autoidx.db = nullptr;
-  }
-
-  for (auto &indice : cattbl->indices) ups_db_close(indice.db, 0);
-  cattbl->indices.clear();
-
-  for (uint32_t i = 0; i < length; i++) {
-    st = ups_env_erase_db(catdb->env, names[i], 0);
-    if (unlikely(st)) {
-      log_error("ups_env_erase_db", st);
-      return 1;
-    }
-  }
-
-  return 0;
-}
-
-// 创建一张Mysql表，创建upsdb中与这张表相关的全部内容
-static ups_status_t create_all_databases(Catalogue::Database *catdb,
-                                         Catalogue::Table *cattbl,
-                                         TABLE *table) {
   ups_db_t *db;
+  ups_status_t st;
   int num_indices = table->s->keys;
   bool has_primary_index = false;
+  boost::shared_ptr<Catalogue::Table> new_table(
+      new Catalogue::Table(table_name));
+  ups_env_t *env = Catalogue::env_manager->env;
+
+  DBUG_ASSERT(num_indices > 0);
+  std::vector<uint16_t> dbnames(num_indices);
+  for (int i = 0; i < num_indices; ++i) {
+    dbnames[i] = Catalogue::env_manager->dbName_tracker.get_new_dbname();
+    if (unlikely(dbnames[i] == 0)) {
+      sql_print_error("no more ups database could be use.");
+      return UPS_LIMITS_REACHED;
+    }
+  }
+
+  // 在创建db的时候可以把lock解锁
+  lock.unlock();
 
   // key info for the primary key
   std::pair<uint32_t, uint32_t> primary_type_info;
 
-  assert(cattbl ? cattbl->indices.empty() : true);
-
-  ups_register_compare(CUSTOM_COMPARE_NAME, custom_compare_func);
-
-  // foreach indexed field: create a database which stores this index
+  // 每轮一个index，创建出对应的db
   KEY *key_info = table->key_info;
   for (int i = 0; i < num_indices; i++, key_info++) {
-    Field *field = key_info->key_part->field;
+    // Field *field = key_info->key_part->field;
 
-    std::pair<uint32_t, uint32_t> type_info;
-    type_info = table_key_info(key_info);
-    uint32_t key_type = type_info.first;
-    uint32_t key_size = type_info.second;
+    uint32_t key_type;
+    uint32_t key_size;
+    st = table_key_info(key_info, key_type, key_size, nullptr);
+    if (unlikely(st != 0)) {
+      return -1;
+    }
+    DBUG_ASSERT(key_type != UPS_TYPE_CUSTOM);
 
     bool enable_duplicates = true;
     bool is_primary_key = false;
 
     if (0 == ::strcmp("PRIMARY", key_info->name)) is_primary_key = true;
+    // 我们不支持无主键
+    if (num_indices == 1) DBUG_ASSERT(is_primary_key);
 
-    if (key_info->actual_flags & HA_NOSAME) enable_duplicates = false;
+    if (is_primary_key) {
+      has_primary_index = true;
+      primary_type_info.first = key_type;
+      primary_type_info.second = key_size;
+      enable_duplicates = false;
+    }
+    if (key_info->flags & HA_NOSAME) enable_duplicates = false;
 
-    // If there is only one key then pretend that it's the primary key
-    if (num_indices == 1) is_primary_key = true;
-
-    if (is_primary_key) has_primary_index = true;
-
-    // enable duplicates for all indices but the first
     uint32_t flags = 0;
     if (enable_duplicates) flags |= UPS_ENABLE_DUPLICATE_KEYS;
 
@@ -809,13 +306,6 @@ static ups_status_t create_all_databases(Catalogue::Database *catdb,
     if (key_size != 0 && key_type == UPS_TYPE_BINARY) {
       params[p].name = UPS_PARAM_KEY_SIZE;
       params[p].value = key_size;
-      p++;
-    }
-
-    // this index requires a custom compare callback function?
-    if (key_type == UPS_TYPE_CUSTOM) {
-      params[p].name = UPS_PARAM_CUSTOM_COMPARE_NAME;
-      params[p].value = (uint64_t)CUSTOM_COMPARE_NAME;
       p++;
     }
 
@@ -839,89 +329,20 @@ static ups_status_t create_all_databases(Catalogue::Database *catdb,
       p++;
     }
 
-    // is record compression enabled?
-    if (is_primary_key && cattbl->record_compression) {
-      params[p].name = UPS_PARAM_RECORD_COMPRESSION;
-      params[p].value = cattbl->record_compression;
-      p++;
-    }
-
-    ups_status_t st =
-        ups_env_create_db(catdb->env, &db, dbname(i), flags, params);
+    st = ups_env_create_db(env, &db, dbnames[i], flags, params);
     if (unlikely(st != 0)) {
       log_error("ups_env_create_db", st);
       return st;
     }
 
-    if (cattbl)
-      cattbl->indices.emplace_back(db, field, enable_duplicates, is_primary_key,
-                                   key_type);
+    new_table->indices.emplace_back(db, i, is_primary_key, key_type);
   }
 
-  // no primary index? then create a record-number database
-  if (!has_primary_index) {
-    ups_parameter_t params[] = {{0, 0}, {0, 0}};
-
-    if (cattbl->record_compression) {
-      params[0].name = UPS_PARAM_RECORD_COMPRESSION;
-      params[0].value = cattbl->record_compression;
-    }
-
-    ups_status_t st =
-        ups_env_create_db(catdb->env, &db, 1, UPS_RECORD_NUMBER32, &params[0]);
-    if (unlikely(st != 0)) {
-      log_error("ups_env_create_db", st);
-      return st;
-    }
-    if (cattbl)
-      cattbl->autoidx = Catalogue::Index(db, 0, false, true, UPS_TYPE_UINT32);
-  }
-
+  DBUG_ASSERT(has_primary_index == true);
+  // 把new_table放到env_manager里面，需要重新加锁
+  lock.lock();
+  Catalogue::env_manager->table_map.emplace(table_name, new_table);
   return 0;
-}
-
-// 把一个Mysql表（一个upsdb的env，一个Catalogue::Databas）附加到ups
-// server上，路径是path
-static int attach_to_server(Catalogue::Database *catdb, const char *path) {
-  ups_status_t st;
-  assert(catdb->is_server_enabled);
-
-  if (!catdb->srv) {
-    ups_srv_config_t cfg;
-    ::memset(&cfg, 0, sizeof(cfg));
-    cfg.port = catdb->server_port;
-
-    st = ups_srv_init(&cfg, &catdb->srv);
-    if (unlikely(st != 0)) {
-      log_error("ups_srv_init", st);
-      return 1;
-    }
-  }
-
-  st = ups_srv_add_env(catdb->srv, catdb->env, path);
-  if (unlikely(st != 0)) {
-    log_error("ups_srv_add_env", st);
-    return 1;
-  }
-
-  return 0;
-}
-
-// 关闭一个MySQL表相关的全部upsdb（存了这个表的全部索引）
-static void close_all_databases(Catalogue::Table *cattbl) {
-  ups_status_t st;
-
-  for (size_t i = 0; i < cattbl->indices.size(); i++) {
-    st = ups_db_close(cattbl->indices[i].db, 0);
-    if (unlikely(st != 0)) log_error("ups_db_close", st);
-  }
-  cattbl->indices.clear();
-
-  if (cattbl->autoidx.db != nullptr) {
-    st = ups_db_close(cattbl->autoidx.db, 0);
-    if (unlikely(st != 0)) log_error("ups_db_close", st);
-    cattbl->autoidx.db = nullptr;
-  }
 }
 
 /**
@@ -995,19 +416,20 @@ static bool sar_is_supported_system_table(const char *db,
   It's just an example of THDVAR_SET() usage below.
 */
 
-//static MYSQL_THDVAR_STR(last_create_thdvar, PLUGIN_VAR_MEMALLOC, NULL, NULL,
-//                        NULL, NULL);
+// static MYSQL_THDVAR_STR(last_create_thdvar, PLUGIN_VAR_MEMALLOC, NULL, NULL,
+//                         NULL, NULL);
 //
-//static MYSQL_THDVAR_UINT(create_count_thdvar, 0, NULL, NULL, NULL, 0, 0, 1000,
-//                         0);
+// static MYSQL_THDVAR_UINT(create_count_thdvar, 0, NULL, NULL, NULL, 0, 0,
+// 1000,
+//                          0);
 //{
-//    THD *thd = ha_thd();
-//    THDVAR_SET(thd, last_create_thdvar, buf);
-//    my_free(buf);
+//     THD *thd = ha_thd();
+//     THDVAR_SET(thd, last_create_thdvar, buf);
+//     my_free(buf);
 //
-//    uint count = THDVAR(thd, create_count_thdvar) + 1;
-//    THDVAR_SET(thd, create_count_thdvar, &count);
-//}
+//     uint count = THDVAR(thd, create_count_thdvar) + 1;
+//     THDVAR_SET(thd, create_count_thdvar, &count);
+// }
 
 /**
   @brief
@@ -1028,77 +450,16 @@ static bool sar_is_supported_system_table(const char *db,
   ha_create_table() in handle.cc
 */
 
-int ha_sar::create(const char *name, TABLE *table, HA_CREATE_INFO *create_info, dd::Table *) {
-    DBUG_ENTER("ha_sar::create");
+int ha_sar::create(const char *name, TABLE *table, HA_CREATE_INFO *,
+                   dd::Table *) {
+  DBUG_ENTER("ha_sar::create");
+  ups_status_t st;
 
-    std::string env_name = format_environment_name(name);
+  // create a database for each index
+  st = create_mysql_table(name, table);
 
-    // See if the Catalogue::Database was already created; otherwise create
-    // a new one
-    boost::mutex::scoped_lock lock_tb(Catalogue::databases_mutex);
-    std::string db_name = env_name; // TODO boost::filesystem::path(name).parent_path().string();
-    catdb = Catalogue::databases[db_name];
-    if (!catdb) {
-      catdb = new Catalogue::Database(db_name);
-      Catalogue::databases[db_name] = catdb;
-    }
-
-    // Now create the table information
-    std::string tbl_name = boost::filesystem::path(name).filename().string();
-    assert(catdb->tables.find(tbl_name) == catdb->tables.end());
-    cattbl = catdb->tables[tbl_name];
-    if (!cattbl) {
-      cattbl = new Catalogue::Table(tbl_name);
-      catdb->tables[tbl_name] = cattbl;
-    }
-
-    // parse the configuration settings from the configuration file (will
-    // not do anything if the file does not yet exist)
-    ParserStatus ps = parse_config_file(env_name + ".cnf", catdb, false);
-    if (!ps.first) {
-      sql_print_error("Invalid configuration file '%s.cnf': %s", env_name.c_str(),
-                      ps.second.c_str());
-      DBUG_RETURN(1);
-    }
-
-    // parse the configuration settings in the table's COMMENT
-    if (create_info->comment.length > 0) {
-      ps = parse_comment_list(create_info->comment.str, cattbl);
-      if (!ps.first) {
-        sql_print_error("Invalid COMMENT string: %s", ps.second.c_str());
-        DBUG_RETURN(1);
-      }
-    }
-
-    // write the settings to the configuration file; the user can then
-    // modify them
-//    if (!boost::filesystem::exists(env_name + ".cnf"))
-//      write_configuration_settings(env_name, create_info->comment.str, catdb);
-
-    ups_status_t st = 0;
-    if (catdb->env == nullptr) {
-      st = ups_env_create(&catdb->env, env_name.c_str(),
-                          catdb->flags, 0644,
-                          !catdb->params.empty() ? &catdb->params[0]
-                              : nullptr);
-      if (st != 0) {
-        log_error("ups_env_create", st);
-        DBUG_RETURN(1);
-      }
-    }
-
-    // create a database for each index
-    st = create_all_databases(catdb, cattbl, table);
-
-    // persist the initial autoincrement-value
-    cattbl->autoinc_value = create_info->auto_increment_value;
-
-    // We have to clean up the database handles because cattbl->indices[].field
-    // will be invalidated by the caller
-    close_all_databases(cattbl);
-
-    DBUG_RETURN(st ? 1 : 0);
-  }
+  DBUG_RETURN(st ? 1 : 0);
+}
 
 /**
   @brief
@@ -1118,150 +479,25 @@ int ha_sar::create(const char *name, TABLE *table, HA_CREATE_INFO *create_info, 
 int ha_sar::open(const char *name, int, uint, const dd::Table *) {
   DBUG_ENTER("ha_sar::open");
 
-  ups_register_compare(CUSTOM_COMPARE_NAME, custom_compare_func);
+  // TODO 应该把其他函数修改地更通用，而不是在这assert
+  DBUG_ASSERT(table_share->primary_key == 0);
+
+  share = get_share();
+  if (unlikely(!share)) DBUG_RETURN(1);
+
+  thr_lock_data_init(&share->lock, &lock_data, nullptr);
+  // ups_register_compare(CUSTOM_COMPARE_NAME, custom_compare_func);
   ups_set_committed_flush_threshold(30);
   record_arena.resize(table->s->rec_buff_length);
 
-  // TODO ref_length的值是自己设置的，不知道Mysql会不会依赖这个值，先不管它，因为我们的
-  // 程序逻辑中是可以不要这个值的
-  // ref_length = 0;
+  Catalogue::env_manager->lock.lock();
+  current_table = Catalogue::env_manager->get_table_from_name(name);
+  Catalogue::env_manager->lock.unlock();
 
-  std::string env_name = format_environment_name(name);
-
-  // See if the Catalogue::Database was already created; otherwise create
-  // a new one
-  boost::mutex::scoped_lock lock_s(Catalogue::databases_mutex);
-  std::string db_name =
-      env_name;  // TODO boost::filesystem::path(name).parent_path().string();
-  catdb = Catalogue::databases[db_name];
-  if (!catdb) {
-    catdb = new Catalogue::Database(db_name);
-    Catalogue::databases[db_name] = catdb;
-  }
-
-  // Now create the table information
-  std::string tbl_name = boost::filesystem::path(name).filename().string();
-  cattbl = catdb->tables[tbl_name];
-  bool already_initialized = false;
-  if (!cattbl) {
-    cattbl = new Catalogue::Table(tbl_name);
-    catdb->tables[tbl_name] = cattbl;
-  }
-
-  if (!cattbl->indices.empty() || cattbl->autoidx.db != nullptr)
-    already_initialized = true;
-
-  // TODO 问题是不是出在这？
-  Sar_share *table_share = get_share();
-  thr_lock_data_init(&table_share->lock, &lock_data, nullptr);
-
-  // parse the configuration settings in the table's .cnf file
-  ParserStatus ps = parse_config_file(env_name + ".cnf", catdb, true);
-  if (!ps.first) {
-    sql_print_error("Invalid configuration file '%s.cnf': %s", env_name.c_str(),
-                    ps.second.c_str());
+  if (!current_table) {
+    sql_print_error("table %s not found", name);
     DBUG_RETURN(1);
   }
-
-  if (already_initialized) DBUG_RETURN(0);
-
-  // Temporary databases are opened in memory; read-only databases are
-  // opened in read-only mode
-  /*
-  if (mode & O_RDONLY)
-    catdb->config.flags |= UPS_READ_ONLY;
-  if (mode & HA_OPEN_TMP_TABLE)
-    catdb->flags |= UPS_ENABLE_TRANSACTIONS | UPS_IN_MEMORY;
-*/
-
-  // open the Environment
-  recovery_table = table;
-  ups_status_t st = 0;
-  if (catdb->env == nullptr) {
-    st = ups_env_open(&catdb->env, env_name.c_str(), catdb->flags,
-                      !catdb->params.empty() ? &catdb->params[0] : nullptr);
-    // UPS_NEED_RECOVERY
-    if (unlikely(st != 0)) {
-      log_error("ups_env_open", st);
-      DBUG_RETURN(1);
-    }
-  }
-
-  ups_db_t *db;
-
-  int num_indices = table->s->keys;
-  bool has_primary_index = false;
-
-  // 与index相关的db已经创建好了
-  if (!cattbl->indices.empty() || cattbl->autoidx.db != nullptr) DBUG_RETURN(0);
-
-  // 下面这一堆东西应该是create table时候做的
-  // foreach indexed field: open the database which stores this index
-  KEY *key_info = table->key_info;
-  for (int i = 0; i < num_indices; i++, key_info++) {
-    Field *field = key_info->key_part->field;
-
-    bool is_primary_key = false;
-    bool enable_duplicates = true;
-    if (0 == ::strcmp("PRIMARY", key_info->name)) is_primary_key = true;
-
-    if (key_info->actual_flags & HA_NOSAME) enable_duplicates = false;
-
-    // If there is only one key then pretend that it's the primary key!
-    if (num_indices == 1) is_primary_key = true;
-
-    if (is_primary_key) {
-      has_primary_index = true;
-      // cattbl->ref_length = ref_length = table->key_info[0].key_length;
-      cattbl->ref_length = table->key_info[0].key_length;
-    }
-
-    st = ups_env_open_db(catdb->env, &db, dbname(i), 0, nullptr);
-    if (st != 0) {
-      log_error("ups_env_open_db", st);
-      DBUG_RETURN(1);
-    }
-
-    // This leaks an object, but they're so tiny. Ignored for now.
-    ups_set_context_data(db, new CustomCompareState(&table->key_info[i]));
-
-    std::pair<uint32_t, uint32_t> type_info;
-    type_info = table_key_info(key_info);
-    uint32_t key_type = type_info.first;
-
-    cattbl->indices.emplace_back(db, field, enable_duplicates, is_primary_key,
-                                 key_type);
-
-    // is this an auto-increment field? if the database is filled then read
-    // the maximum value, otherwise initialize from the cached create_info
-    if (field == table->found_next_number_field) {
-      for (uint32_t k = 0; k < key_info->user_defined_key_parts; k++) {
-        if (key_info->key_part[k].field == field) {
-          cattbl->autoinc_value =
-              initialize_autoinc(&key_info->key_part[k], db);
-          cattbl->initial_autoinc_value = cattbl->autoinc_value + 1;
-          break;
-        }
-      }
-    }
-  }
-
-  // no primary index? then create a record-number database
-  if (!has_primary_index) {
-    st = ups_env_open_db(catdb->env, &db, 1, 0, nullptr);
-    if (unlikely(st != 0)) {
-      log_error("ups_env_open_db", st);
-      DBUG_RETURN(1);
-    }
-
-    // cattbl->ref_length = ref_length = sizeof(uint32_t);
-    cattbl->ref_length = sizeof(uint32_t);
-    cattbl->autoidx =
-        Catalogue::Index(db, nullptr, false, true, UPS_TYPE_UINT32);
-  }
-
-  if (catdb->is_server_enabled)
-    DBUG_RETURN(attach_to_server(catdb, name + 1));  // skip leading "."
 
   DBUG_RETURN(0);
 }
@@ -1281,77 +517,70 @@ int ha_sar::open(const char *name, int, uint, const dd::Table *) {
   sql_base.cc, sql_select.cc and table.cc
 */
 
-int ha_sar::close(void) {
+int ha_sar::close() {
   DBUG_ENTER("ha_sar::close");
-  if (cursor) ups_cursor_close(cursor);
+
+  // if trx then commit or abort trx
+
+  if (likely(current_table != nullptr)) {
+    current_table = nullptr;
+  }
+  active_index = MAX_KEY;
+  if (current_cursor) ups_cursor_close(current_cursor);
 
   DBUG_RETURN(0);
 }
 
-static inline int insert_auto_index(Catalogue::Table *cattbl, TABLE *table,
-                                    uint8_t *buf, ups_txn_t *txn,
-                                    ByteVector &key_arena,
-                                    ByteVector &record_arena) {
-  ups_key_t key = ups_make_key(nullptr, 0);
-  ups_record_t record = record_from_row(table, buf, record_arena);
+// static inline int insert_auto_index(Catalogue::Table *cattbl, TABLE *table,
+//                                     uint8_t *buf, ups_txn_t *txn,
+//                                     ByteVector &key_arena,
+//                                     ByteVector &record_arena) {
+//   ups_key_t key = ups_make_key(nullptr, 0);
+//   ups_record_t record = record_from_row(table, buf, record_arena);
+//
+//   ups_status_t st = ups_db_insert(cattbl->autoidx.db, txn, &key, &record, 0);
+//   if (unlikely(st != 0)) {
+//     log_error("ups_db_insert", st);
+//     return 1;
+//   }
+//
+//   // Need to copy the key in the ByteVector - it will be required later
+//   key_arena.resize(key.size);
+//   ::memcpy(key_arena.data(), key.data, key.size);
+//   return 0;
+// }
 
-  ups_status_t st = ups_db_insert(cattbl->autoidx.db, txn, &key, &record, 0);
-  if (unlikely(st != 0)) {
-    log_error("ups_db_insert", st);
-    return 1;
-  }
-
-  // Need to copy the key in the ByteVector - it will be required later
-  key_arena.resize(key.size);
-  ::memcpy(key_arena.data(), key.data, key.size);
-  return 0;
-}
-
-static inline int insert_primary_key(Catalogue::Index *catidx, TABLE *table,
+static inline int insert_primary_key(Catalogue::Index &catidx, TABLE *table,
                                      uint8_t *buf, ups_txn_t *txn,
                                      ByteVector &key_arena,
                                      ByteVector &record_arena) {
-  ups_key_t key = key_from_row(table, buf, 0, key_arena);
+  ups_key_t key = key_from_row(buf, get_key_info(table, catidx.key_index), key_arena);
   ups_record_t record = record_from_row(table, buf, record_arena);
 
-  //  // check if the key is greater than the current maximum. If yes then the
-  //  // key is unique, and we can specify the flag UPS_OVERWRITE (which is much
-  //  // faster)
-  //  uint32_t flags = 0;
-  //  if (likely(catidx->enable_duplicates))
-  //    flags = UPS_DUPLICATE;
-
-  ups_status_t st = ups_db_insert(catidx->db, txn, &key, &record, 0);
+  ups_status_t st = ups_db_insert(catidx.db, txn, &key, &record, 0);
 
   if (unlikely(st == UPS_DUPLICATE_KEY)) return HA_ERR_FOUND_DUPP_KEY;
   if (unlikely(st != 0)) {
     log_error("ups_db_insert", st);
     return 1;
   }
-
-  // Need to copy the key in the ByteVector - it will be required later
-  // TODO it's copied *from* key_arena *to* key_arena - says valgrind
-  // TODO looks like this is not required
-  //  key_arena.resize(key.size);
-  //  ::memmove(key_arena.data(), key.data, key.size);
   return 0;
 }
 
-static inline int insert_secondary_key(Catalogue::Index *catidx, TABLE *table,
-                                       int index, uint8_t *buf, ups_txn_t *txn,
-                                       ByteVector &key_arena,
-                                       ByteVector &primary_key) {
+static inline int insert_secondary_key(TABLE* table, Catalogue::Index &catidx, uint8_t *buf,
+                                       ups_txn_t *txn, ByteVector &key_arena,
+                                       ByteVector &record_arena) {
   // The record of the secondary index is the primary key of the row
-  ups_record_t record =
-      ups_make_record(primary_key.data(), (uint16_t)primary_key.size());
+  ups_key_t primary_key = key_from_row(buf, get_key_info(table, 0), record_arena);
+  ups_record_t record = ups_make_record(primary_key.data, primary_key.size);
 
   // The actual key is the column's value
-  ups_key_t key = key_from_row(table, buf, index, key_arena);
+  ups_key_t key = key_from_row(buf, get_key_info(table, catidx.key_index), key_arena);
 
   uint32_t flags = 0;
-  if (likely(catidx->enable_duplicates)) flags = UPS_DUPLICATE;
+  if (key_enable_duplicates(get_key_info(table, catidx.key_index))) flags = UPS_DUPLICATE;
 
-  ups_status_t st = ups_db_insert(catidx->db, txn, &key, &record, flags);
+  ups_status_t st = ups_db_insert(catidx.db, txn, &key, &record, flags);
   if (unlikely(st == UPS_DUPLICATE_KEY)) return HA_ERR_FOUND_DUPP_KEY;
   if (unlikely(st != 0)) {
     log_error("ups_db_insert", st);
@@ -1364,26 +593,17 @@ static inline int insert_multiple_indices(Catalogue::Table *cattbl,
                                           TABLE *table, uint8_t *buf,
                                           ups_txn_t *txn, ByteVector &key_arena,
                                           ByteVector &record_arena) {
-  // is this an automatically generated index?
-  if (cattbl->autoidx.db) {
-    int rc =
-        insert_auto_index(cattbl, table, buf, txn, key_arena, record_arena);
-    if (unlikely(rc)) return rc;
-  }
-
-  for (int index = 0; index < (int)cattbl->indices.size(); index++) {
+  for (auto &idx : cattbl->indices) {
     // is this the primary index?
-    if (cattbl->indices[index].is_primary_index) {
-      assert(index == 0);
-      int rc = insert_primary_key(&cattbl->indices[index], table, buf, txn,
-                                  key_arena, record_arena);
+    if (idx.is_primary_index) {
+      int rc =
+          insert_primary_key(idx, table, buf, txn, key_arena, record_arena);
       if (unlikely(rc)) return rc;
     }
     // is this a secondary index? the last parameter is a ByteVector with
     // the primary key.
     else {
-      int rc = insert_secondary_key(&cattbl->indices[index], table, index, buf,
-                                    txn, record_arena, key_arena);
+      int rc = insert_secondary_key(table, idx, buf, txn, key_arena, record_arena);
       if (unlikely(rc)) return rc;
     }
   }
@@ -1424,11 +644,11 @@ static inline ups_cursor_t *locate_secondary_key(ups_db_t *db, ups_txn_t *txn,
 }
 
 // 删除secondary_index中的一条记录，其中primary_key是记录的值
-static inline int delete_from_secondary(ups_db_t *db, TABLE *table, int index,
+static inline int delete_from_secondary(ups_db_t *db, KEY *key_info,
                                         const uint8_t *buf, ups_txn_t *txn,
                                         ups_key_t *primary_key,
                                         ByteVector &key_arena) {
-  ups_key_t key = key_from_row(table, buf, index, key_arena);
+  ups_key_t key = key_from_row(buf, key_info, key_arena);
   ups_record_t primary_record =
       ups_make_record(primary_key->data, primary_key->size);
   CursorProxy cp(locate_secondary_key(db, txn, &key, &primary_record));
@@ -1445,41 +665,28 @@ static inline int delete_from_secondary(ups_db_t *db, TABLE *table, int index,
 }
 
 // 删除一个Mysql的row记录，以及与它相关的secondary_index
-static inline int delete_multiple_indices(ups_cursor_t *cursor,
-                                          Catalogue::Database *catdb,
-                                          Catalogue::Table *cattbl,
-                                          TABLE *table, const uint8_t *buf,
-                                          ByteVector &key_arena) {
+static int delete_multiple_indices(TABLE* table, Catalogue::Table *cattbl, const uint8_t *buf,
+                                   ByteVector &key_arena) {
   ups_status_t st;
 
-  TxnProxy txnp(catdb->env);
+  TxnProxy txnp(Catalogue::env_manager->env);
   if (unlikely(!txnp.txn)) return 1;
 
   ups_key_t primary_key;
 
-  // The cursor is positioned on the primary key. If the index was auto-
-  // generated then fetch the key, otherwise extract the key from |buf|
-  if (cattbl->autoidx.db) {
-    st = ups_cursor_move(cursor, &primary_key, 0, 0);
-    if (unlikely(st != 0)) {
-      log_error("ups_cursor_erase", st);
-      return 1;
-    }
-  } else {
-    ups_key_t key = key_from_row(table, buf, 0, key_arena);
-    primary_key = key;
-  }
+  // extract the key from |buf|
+  ups_key_t key = key_from_row(buf, get_key_info(table, cattbl->indices[0].key_index), key_arena);
+  primary_key = key;
 
-  for (int index = 0; index < (int)cattbl->indices.size(); index++) {
-    Field *field = cattbl->indices[index].field;
-    assert(field->m_indexed == true && field->stored_in_db != false);
+  for (auto &idx : cattbl->indices) {
+    // for debug
+    Field *field = get_key_info(table, idx.key_index)->key_part->field;
+    DBUG_ASSERT(field->m_indexed == true && field->stored_in_db != false);
     (void)field;
 
     // is this the primary index?
-    if (cattbl->indices[index].is_primary_index) {
-      // TODO can we use |cursor|? no, because it's not part of the txn :-/
-      assert(index == 0);
-      st = ups_db_erase(cattbl->indices[index].db, txnp.txn, &primary_key, 0);
+    if (idx.is_primary_index) {
+      st = ups_db_erase(idx.db, txnp.txn, &primary_key, 0);
       if (unlikely(st != 0)) {
         log_error("ups_db_erase", st);
         return 1;
@@ -1487,8 +694,8 @@ static inline int delete_multiple_indices(ups_cursor_t *cursor,
     }
     // is this a secondary index?
     else {
-      int rc = delete_from_secondary(cattbl->indices[index].db, table, index,
-                                     buf, txnp.txn, &primary_key, key_arena);
+      int rc = delete_from_secondary(idx.db, get_key_info(table, idx.key_index), buf, txnp.txn,
+                                     &primary_key, key_arena);
       if (unlikely(rc != 0)) return rc;
     }
   }
@@ -1534,6 +741,7 @@ static ups_key_t extract_key(const uint8_t *keybuf, KEY *key_info,
 
   // if this is not a multi-part key AND it has fixed length then we can
   // simply use the existing |keybuf| pointer for the lookup
+  // TODO 关于key_part的null_bit 我不太了解，先这样放着吧
   if (key_parts == 1 && encoded_length_bytes(key_part->type) == 0) {
     key.data = key_part->null_bit ? (void *)(keybuf + 1) : (void *)keybuf;
     key.size = key_part->length;
@@ -1591,7 +799,7 @@ static ups_key_t extract_first_keys(const uint8_t *keybuf, TABLE *table,
                                     KEY *key_info, ByteVector &key_arena) {
   ups_key_t key = ups_make_key(nullptr, 0);
   KEY_PART_INFO *key_part = key_info->key_part;
-  assert(key_info->user_defined_key_parts > 1);
+  DBUG_ASSERT(key_info->user_defined_key_parts > 1);
 
   const uint8_t *p = keybuf;
   key_arena.clear();
@@ -1661,38 +869,38 @@ static ups_key_t extract_first_keys(const uint8_t *keybuf, TABLE *table,
 */
 
 int ha_sar::write_row(uchar *buf) {
+  // table->s->reclength是一行（一个record）的最大长度，也就是说对于varchar等
+  // 变长类型，会是其最长长度（而不是实际长度），直接用会有空间浪费，所以才需要自行提取
   DBUG_ENTER("ha_sar::write_row");
 
   ups_status_t st;
-  duplicate_error_index = (uint32_t)-1;
+  // duplicate_error_index = (uint32_t)-1;
 
-  // no index? then use the one which was automatically generated
-  if (cattbl->indices.empty())
-    DBUG_RETURN(insert_auto_index(cattbl, table, buf, nullptr, key_arena,
-                                  record_arena));
+  // no index?
+  DBUG_ASSERT(!current_table->indices.empty());
 
-  // auto-incremented index? then get a new value
-  if (table->next_number_field && buf == table->record[0]) {
-    int rc = update_auto_increment();
-    if (unlikely(rc)) DBUG_RETURN(rc);
-  }
+  //  // auto-incremented index? then get a new value
+  //  if (table->next_number_field && buf == table->record[0]) {
+  //    int rc = update_auto_increment();
+  //    if (unlikely(rc)) DBUG_RETURN(rc);
+  //  }
 
-  // only one index? then use a temporary transaction
-  if (cattbl->indices.size() == 1 && !cattbl->autoidx.db) {
-    int rc = insert_primary_key(&cattbl->indices[0], table, buf, nullptr,
+  // only one index? do not need transaction
+  if (current_table->indices.size() == 1) {
+    int rc = insert_primary_key(current_table->indices[0], table, buf, nullptr,
                                 key_arena, record_arena);
-    if (unlikely(rc == HA_ERR_FOUND_DUPP_KEY)) duplicate_error_index = 0;
+    // if (unlikely(rc == HA_ERR_FOUND_DUPP_KEY)) duplicate_error_index = 0;
     DBUG_RETURN(rc);
   }
 
   // multiple indices? then create a new transaction and update
   // all indices
-  TxnProxy txnp(catdb->env);
+  TxnProxy txnp(Catalogue::env_manager->env);
   if (unlikely(!txnp.txn)) DBUG_RETURN(1);
 
-  int rc = insert_multiple_indices(cattbl, table, buf, txnp.txn, key_arena,
-                                   record_arena);
-  if (unlikely(rc == HA_ERR_FOUND_DUPP_KEY)) duplicate_error_index = 0;
+  int rc = insert_multiple_indices(current_table.get(), table, buf, txnp.txn,
+                                   key_arena, record_arena);
+  // if (unlikely(rc == HA_ERR_FOUND_DUPP_KEY)) duplicate_error_index = 0;
   if (unlikely(rc)) DBUG_RETURN(rc);
 
   st = txnp.commit();
@@ -1726,46 +934,26 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
   DBUG_ENTER("ha_sar::update_row");
 
   ups_status_t st;
-  ups_record_t record = record_from_row(table, new_buf, record_arena);
+  ups_record_t new_rec = record_from_row(table, new_buf, record_arena);
 
-  // fastest code path: if there's no index then use the cursor to overwrite
-  // the record
-  if (cattbl->indices.empty()) {
-    assert(cursor != nullptr);
-    st = ups_cursor_overwrite(cursor, &record, 0);
-    if (unlikely(st != 0)) {
-      log_error("ups_cursor_overwrite", st);
-      DBUG_RETURN(1);
-    }
-    DBUG_RETURN(0);
-  }
+  DBUG_ASSERT(!current_table->indices.empty());
 
-  // build a map of the keys that are updated
-  // TODO we're extracting keys over and over in the remaining code.
-  // it might make sense to cache the old and new keys
-  bool changed[MAX_KEY];
-  ByteVector tmp1;
-  ByteVector tmp2;
-  for (size_t i = 0; i < cattbl->indices.size(); i++) {
-    ups_key_t oldkey = key_from_row(table, (uchar *)old_buf, i, tmp1);
-    ups_key_t newkey = key_from_row(table, new_buf, i, key_arena);
-    changed[i] = !are_keys_equal(&oldkey, &newkey);
-  }
+  std::vector<bool> changed(MAX_KEY, false);
 
   // fast code path: if there's just one primary key then try to overwrite
   // the record, or re-insert if the key was modified
-  if (cattbl->indices.size() == 1 && cattbl->autoidx.db == nullptr) {
+  if (current_table->indices.size() == 1) {
+    ups_key_t oldkey = key_from_row((uchar *)old_buf, get_key_info(table, current_table->indices[0].key_index),
+                                    old_pk);
+    ups_key_t newkey =
+        key_from_row(new_buf, get_key_info(table, current_table->indices[0].key_index), key_arena);
+    bool equal = are_keys_equal(&oldkey, &newkey);
+
     // if both keys are equal: simply overwrite the record of the
     // current key
-    if (!changed[0]) {
-      if (likely(cursor != nullptr)) {
-        assert(ups_cursor_get_database(cursor) == cattbl->indices[0].db);
-        st = ups_cursor_overwrite(cursor, &record, 0);
-      } else {
-        ups_key_t key = key_from_row(table, (uchar *)old_buf, 0, tmp1);
-        st = ups_db_insert(cattbl->indices[0].db, nullptr, &key, &record,
-                           UPS_OVERWRITE);
-      }
+    if (equal) {
+      st = ups_db_insert(current_table->indices[0].db, nullptr, &oldkey,
+                         &new_rec, UPS_OVERWRITE);
       if (unlikely(st != 0)) {
         log_error("ups_cursor_overwrite", st);
         DBUG_RETURN(1);
@@ -1773,26 +961,22 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
       DBUG_RETURN(0);
     }
 
-    ups_key_t oldkey = key_from_row(table, (uchar *)old_buf, 0, tmp1);
-    ups_key_t newkey = key_from_row(table, new_buf, 0, key_arena);
-
     // otherwise delete the old row, insert the new one. Inserting can fail if
     // the key is not unique, therefore both operations are wrapped
     // in a single transaction.
-    TxnProxy txnp(catdb->env);
+    TxnProxy txnp(Catalogue::env_manager->env);
     if (unlikely(!txnp.txn)) {
-        DBUG_RETURN(1);
+      DBUG_RETURN(1);
     }
 
-    // TODO can we use the cursor?? no - not in the transaction :-/
-    ups_db_t *db = cattbl->indices[0].db;
+    ups_db_t *db = current_table->indices[0].db;
     st = ups_db_erase(db, txnp.txn, &oldkey, 0);
     if (unlikely(st != 0)) {
-        log_error("ups_db_erase", st);
-        DBUG_RETURN(1);
+      log_error("ups_db_erase", st);
+      DBUG_RETURN(1);
     }
 
-    st = ups_db_insert(db, txnp.txn, &newkey, &record, 0);
+    st = ups_db_insert(db, txnp.txn, &newkey, &new_rec, 0);
     if (unlikely(st == UPS_DUPLICATE_KEY)) DBUG_RETURN(HA_ERR_FOUND_DUPP_KEY);
     if (unlikely(st != 0)) {
       log_error("ups_db_insert", st);
@@ -1803,65 +987,80 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
     DBUG_RETURN(st == 0 ? 0 : 1);
   }
 
+  size_t i = 0;
+  for (auto &idx : current_table->indices) {
+    ups_key_t oldkey =
+        key_from_row((uchar *)old_buf, get_key_info(table, idx.key_index), old_second_k);
+    ups_key_t newkey = key_from_row(new_buf, get_key_info(table, idx.key_index), new_second_k);
+    changed[i++] = !are_keys_equal(&oldkey, &newkey);
+  }
+
   // More than one index? Update all indices that were changed.
   // Again wrap all of this in a single transaction, in case we fail
   // to insert the new row.
-  TxnProxy txnp(catdb->env);
+  TxnProxy txnp(Catalogue::env_manager->env);
   if (unlikely(!txnp.txn)) {
     DBUG_RETURN(1);
   }
 
-  ups_key_t new_primary_key = key_from_row(table, new_buf, 0, record_arena);
-
-  // Are we overwriting an auto-generated index?
-  if (cattbl->autoidx.db) {
-    ups_key_t k = ups_make_key(ref, sizeof(uint32_t));
-    st =
-        ups_db_insert(cattbl->autoidx.db, txnp.txn, &k, &record, UPS_OVERWRITE);
-    if (unlikely(st != 0)) {
-        log_error("ups_db_insert", st);
-        DBUG_RETURN(1);
-    }
-  }
+  ups_key_t new_primary_key =
+      key_from_row(new_buf, get_key_info(table, current_table->indices[0].key_index), key_arena);
+  ups_key_t old_primary_key =
+      key_from_row(old_buf, get_key_info(table, current_table->indices[0].key_index), old_pk);
 
   // Primary index:
   // 1. Was the key modified? then re-insert it
-  // 2. Otherwise overwrite the record
-  // TODO can we use the cursor? -> no, it's not in the txn :-/
+  // 2. Otherwise, overwrite the record
   if (changed[0]) {
-    ups_key_t oldkey = key_from_row(table, (uchar *)old_buf, 0, key_arena);
-    st = ups_db_erase(cattbl->indices[0].db, txnp.txn, &oldkey, 0);
+    // ups_key_t oldkey = key_from_row((uchar *)old_buf,
+    // current_table->indices[0].key_info, old_pk);
+    st = ups_db_erase(current_table->indices[0].db, txnp.txn, &old_primary_key,
+                      0);
     if (unlikely(st != 0)) {
       log_error("ups_db_erase", st);
       DBUG_RETURN(1);
     }
+    st = ups_db_insert(current_table->indices[0].db, txnp.txn, &new_primary_key,
+                       &new_rec, 0);
+    if (unlikely(st == UPS_DUPLICATE_KEY)) DBUG_RETURN(HA_ERR_FOUND_DUPP_KEY);
+    if (unlikely(st != 0)) {
+      log_error("ups_db_insert", st);
+      DBUG_RETURN(1);
+    }
+  } else {
+    st = ups_db_insert(current_table->indices[0].db, txnp.txn, &new_primary_key,
+                       &new_rec, UPS_OVERWRITE);
+    if (unlikely(st != 0)) {
+      log_error("ups_db_insert", st);
+      DBUG_RETURN(1);
+    }
   }
-  st = ups_db_insert(cattbl->indices[0].db, txnp.txn, &new_primary_key, &record,
-                     UPS_OVERWRITE);
-  if (unlikely(st != 0)) {
-    log_error("ups_db_insert", st);
-    DBUG_RETURN(1);
-  }
+
 
   // All secondary indices:
-  // 1. if the primary key was changed then their record has to be
+  // 1. if the primary key was changed then their new_rec has to be
   //    overwritten
   // 2. if the secondary key was changed then re-insert it
-  for (size_t i = 1; i < cattbl->indices.size(); i++) {
-    ups_record_t new_primary_record =
-        ups_make_record(new_primary_key.data, new_primary_key.size);
-    ups_key_t old_primary_key = key_from_row(table, old_buf, 0, tmp1);
-    ups_key_t newkey = key_from_row(table, (uchar *)new_buf, i, tmp2);
 
+  // 新旧的record_arena record，给secondary key作为record
+  ups_record_t new_primary_key_record =
+      ups_make_record(new_primary_key.data, new_primary_key.size);
+  ups_record_t old_primary_key_record =
+      ups_make_record(old_primary_key.data, old_primary_key.size);
+  for (i = 1; i < current_table->indices.size(); i++) {
+    ups_key_t newkey = key_from_row(
+        (uchar *)new_buf, get_key_info(table, current_table->indices[i].key_index), new_second_k);
     if (changed[i]) {
       // secondary index有修改，去旧存新
-      int rc = delete_from_secondary(cattbl->indices[i].db, table, i, old_buf,
-                                     txnp.txn, &old_primary_key, key_arena);
+      int rc = delete_from_secondary(
+          current_table->indices[i].db, get_key_info(table, current_table->indices[i].key_index),
+          old_buf, txnp.txn, &old_primary_key, old_second_k);
       if (unlikely(rc != 0)) DBUG_RETURN(rc);
       uint32_t flags = 0;
-      if (likely(cattbl->indices[i].enable_duplicates)) flags = UPS_DUPLICATE;
-      st = ups_db_insert(cattbl->indices[i].db, txnp.txn, &newkey,
-                         &new_primary_record, flags);
+      if (key_enable_duplicates(get_key_info(table, current_table->indices[i].key_index)))
+        flags = UPS_DUPLICATE;
+      st = ups_db_insert(current_table->indices[i].db, txnp.txn, &newkey,
+                         &new_primary_key_record, flags);
       if (unlikely(st == UPS_DUPLICATE_KEY)) DBUG_RETURN(HA_ERR_FOUND_DUPP_KEY);
       if (unlikely(st != 0)) {
         log_error("ups_db_insert", st);
@@ -1869,13 +1068,13 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
       }
     } else if (changed[0]) {
       // secondary index没修改，但primary key有修改，只修改record的值
-      ups_key_t oldkey = key_from_row(table, (uchar *)old_buf, i, tmp1);
-      ups_record_t old_primary_record =
-          ups_make_record(old_primary_key.data, old_primary_key.size);
-      CursorProxy cp(locate_secondary_key(cattbl->indices[i].db, txnp.txn,
-                                          &oldkey, &old_primary_record));
-      assert(cp.cursor != nullptr);
-      st = ups_cursor_overwrite(cp.cursor, &new_primary_record, 0);
+      ups_key_t oldkey = key_from_row(
+          (uchar *)old_buf, get_key_info(table, current_table->indices[i].key_index), old_second_k);
+      CursorProxy cp(locate_secondary_key(current_table->indices[i].db,
+                                          txnp.txn, &oldkey,
+                                          &old_primary_key_record));
+      DBUG_ASSERT(cp.cursor != nullptr);
+      st = ups_cursor_overwrite(cp.cursor, &new_primary_key_record, 0);
       if (unlikely(st != 0)) {
         log_error("ups_cursor_overwrite", st);
         DBUG_RETURN(1);
@@ -1915,18 +1114,14 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
 int ha_sar::delete_row(const uchar *buf) {
   DBUG_ENTER("ha_sar::delete_row");
 
+  DBUG_ASSERT(!current_table->indices.empty());
   ups_status_t st;
   // fast code path: if there's just one index then use the cursor to
   // delete the record
-  if (cattbl->indices.size() <= 1) {
-    if (likely(cursor != nullptr))
-      st = ups_cursor_erase(cursor, 0);
-    else {
-      assert(cattbl->indices.size() == 1);
-      ups_key_t key = key_from_row(table, buf, 0, key_arena);
-      st = ups_db_erase(cattbl->indices[0].db, nullptr, &key, 0);
-    }
-
+  if (current_table->indices.size() == 1) {
+    ups_key_t key =
+        key_from_row(buf, get_key_info(table, current_table->indices[0].key_index), key_arena);
+    st = ups_db_erase(current_table->indices[0].db, nullptr, &key, 0);
     if (unlikely(st != 0)) {
       log_error("ups_cursor_erase", st);
       DBUG_RETURN(1);
@@ -1936,8 +1131,7 @@ int ha_sar::delete_row(const uchar *buf) {
 
   // otherwise (if there are multiple indices) then delete the key from
   // each index
-  int rc =
-      delete_multiple_indices(cursor, catdb, cattbl, table, buf, key_arena);
+  int rc = delete_multiple_indices(table, current_table.get(), buf, key_arena);
   DBUG_RETURN(rc);
 }
 
@@ -1945,18 +1139,16 @@ int ha_sar::index_init(uint idx, bool) {
   DBUG_ENTER("ha_sar::index_init");
 
   active_index = idx;
-
-  assert(cattbl != nullptr);
+  DBUG_ASSERT(current_table != nullptr);
+  DBUG_ASSERT(current_cursor == nullptr);
+  DBUG_ASSERT(!current_table->indices.empty());
+  DBUG_ASSERT(idx < current_table->indices.size());
 
   // from which index are we reading?
-  ups_db_t *db = cattbl->indices[idx].db;
+  ups_db_t *db = current_table->indices[idx].db;
 
-  // if there's a cursor then make sure it's for the correct index database
-  if (cursor && ups_cursor_get_database(cursor) == db) DBUG_RETURN(0);
-
-  if (cursor) ups_cursor_close(cursor);
-
-  ups_status_t st = ups_cursor_create(&cursor, db, nullptr, 0);
+  ups_txn_t *tx = get_tx_from_thd(ha_thd());
+  ups_status_t st = ups_cursor_create(&current_cursor, db, tx, 0);
   if (unlikely(st != 0)) {
     log_error("ups_cursor_create", st);
     DBUG_RETURN(1);
@@ -1964,19 +1156,32 @@ int ha_sar::index_init(uint idx, bool) {
 
   DBUG_RETURN(0);
 }
+
 int ha_sar::index_end() {
+  DBUG_ENTER("ha_sar::index_end");
+
+  DBUG_ASSERT(active_index != MAX_KEY);
+  DBUG_ASSERT(current_table != nullptr);
+  DBUG_ASSERT(current_cursor != nullptr);
+
+  ups_status_t st = ups_cursor_close(current_cursor);
+  if (unlikely(st != 0)) {
+    log_error("ups_cursor_close", st);
+    DBUG_RETURN(1);
+  }
+  current_cursor = nullptr;
   active_index = MAX_KEY;
-  return rnd_end();
+  DBUG_RETURN(0);
 }
 
 int ha_sar::index_read(uchar *buf, const uchar *key, uint,
                        enum ha_rkey_function find_flag) {
   DBUG_ENTER("ha_sar::index_read");
-  // MYSQL_INDEX_READ_ROW_START(table_share->db.str,
-  // table_share->table_name.str);
+  DBUG_ASSERT(active_index != MAX_KEY);
+  DBUG_ASSERT(current_table != nullptr);
+  DBUG_ASSERT(current_cursor != nullptr);
 
-  bool read_primary_index = (active_index == 0 || active_index == MAX_KEY) &&
-                            cattbl->autoidx.db == nullptr;
+  bool read_primary_index = (active_index == 0);
 
   // when reading from the primary index: directly fetch record into |buf|
   // if the row has fixed length
@@ -1989,7 +1194,7 @@ int ha_sar::index_read(uchar *buf, const uchar *key, uint,
   ups_status_t st;
 
   if (key == nullptr) {
-    st = ups_cursor_move(cursor, nullptr, &record, UPS_CURSOR_FIRST);
+    st = ups_cursor_move(current_cursor, nullptr, &record, UPS_CURSOR_FIRST);
   } else {
     ups_key_t key_ups =
         extract_key(key, &table->key_info[active_index], key_arena);
@@ -1997,13 +1202,16 @@ int ha_sar::index_read(uchar *buf, const uchar *key, uint,
     switch (find_flag) {
       case HA_READ_KEY_EXACT:
         if (likely(table->key_info[active_index].user_defined_key_parts == 1))
-          st = ups_cursor_find(cursor, &key_ups, &record, 0);
+          st = ups_cursor_find(current_cursor, &key_ups, &record, 0);
         else {
-          st = ups_cursor_find(cursor, &key_ups, &record, UPS_FIND_GEQ_MATCH);
+          st = ups_cursor_find(current_cursor, &key_ups, &record,
+                               UPS_FIND_GEQ_MATCH);
           // if this was an approx. match: verify that the key part is really
           // identical!
           // 下面这段看不懂+不知道有没有必要
           if (ups_key_get_approximate_match_type(&key_ups) != 0) {
+            // cursor找到的key不等于key_ups,这个时候key_ups的指针会指向一个
+            // 临时地址并在后续的ups api中失效，所以key_arena又可用了
             ups_key_t first = extract_first_keys(
                 key, table, &table->key_info[active_index], key_arena);
             if (::memcmp(key_ups.data, first.data, first.size) != 0)
@@ -2011,25 +1219,32 @@ int ha_sar::index_read(uchar *buf, const uchar *key, uint,
           }
         }
         break;
+      // TODO 模糊查询可能有问题
       case HA_READ_KEY_OR_NEXT:
       case HA_READ_PREFIX:
-        st = ups_cursor_find(cursor, &key_ups, &record, UPS_FIND_GEQ_MATCH);
+        st = ups_cursor_find(current_cursor, &key_ups, &record,
+                             UPS_FIND_GEQ_MATCH);
         break;
       case HA_READ_KEY_OR_PREV:
       case HA_READ_PREFIX_LAST_OR_PREV:
-        st = ups_cursor_find(cursor, &key_ups, &record, UPS_FIND_LEQ_MATCH);
+      case HA_READ_PREFIX_LAST:
+        st = ups_cursor_find(current_cursor, &key_ups, &record,
+                             UPS_FIND_LEQ_MATCH);
         break;
       case HA_READ_AFTER_KEY:
-        st = ups_cursor_find(cursor, &key_ups, &record, UPS_FIND_GT_MATCH);
+        st = ups_cursor_find(current_cursor, &key_ups, &record,
+                             UPS_FIND_GT_MATCH);
         break;
       case HA_READ_BEFORE_KEY:
-        st = ups_cursor_find(cursor, &key_ups, &record, UPS_FIND_LT_MATCH);
+        st = ups_cursor_find(current_cursor, &key_ups, &record,
+                             UPS_FIND_LT_MATCH);
         break;
       case HA_READ_INVALID:  // (last)
-        st = ups_cursor_move(cursor, nullptr, &record, UPS_CURSOR_LAST);
+        st = ups_cursor_move(current_cursor, nullptr, &record, UPS_CURSOR_LAST);
         break;
+
       default:
-        assert(!"shouldn't be here");
+        DBUG_ASSERT(!"shouldn't be here");
         st = UPS_INTERNAL_ERROR;
         break;
     }
@@ -2043,23 +1258,14 @@ int ha_sar::index_read(uchar *buf, const uchar *key, uint,
     // Or is this a secondary index? then use the primary key (in the record)
     // to fetch the row
     else if (!read_primary_index) {
-      // Auto-generated index? Then store the internal row-id (which is a 32bit
-      // record number)
-      if (cattbl->autoidx.db != nullptr) {
-        // assert(ref_length == sizeof(uint32_t));
-        assert(record.size == sizeof(uint32_t));
-        *(uint32_t *)ref = *(uint32_t *)record.data;
-      }
-
       ups_key_t key_ups = ups_make_key(record.data, (uint16_t)record.size);
       ups_record_t rec = ups_make_record(nullptr, 0);
       if (row_is_fixed_length(table)) {
         rec.data = buf;
         rec.flags = UPS_RECORD_USER_ALLOC;
       }
-      st = ups_db_find(
-          cattbl->autoidx.db ? cattbl->autoidx.db : cattbl->indices[0].db,
-          nullptr, &key_ups, &rec, 0);
+      st = ups_db_find(current_table->indices[0].db, get_tx_from_thd(ha_thd()),
+                       &key_ups, &rec, 0);
       if (likely(st == 0) && !row_is_fixed_length(table))
         rec = unpack_record(table, &rec, buf);
     }
@@ -2089,73 +1295,28 @@ int ha_sar::index_read(uchar *buf, const uchar *key, uint,
 
 // Helper function which moves the cursor in the direction specified in
 // |flags|, and retrieves the row
-// If flags is 0 then will perform a lookup for |keybuf|, otherwise
-// |keybuf| and |keylen| are ignored
-int ha_sar::index_operation(uchar *keybuf, uint32_t, uchar *buf,
-                            uint32_t flags) {
+// |flags| should not be 0
+int ha_sar::index_operation(uchar *buf, uint32_t flags) {
+  DBUG_ASSERT(active_index != MAX_KEY);
+  DBUG_ASSERT(current_table != nullptr);
+  DBUG_ASSERT(current_cursor != nullptr);
   ups_status_t st;
 
   // when reading from the primary index: directly fetch record into |buf|
   // if the row has fixed length
   ups_record_t record = ups_make_record(nullptr, 0);
-  if ((active_index == 0 || active_index == MAX_KEY) &&
-      row_is_fixed_length(table)) {
+  if ((active_index == 0) && row_is_fixed_length(table)) {
     record.data = buf;
     record.flags = UPS_RECORD_USER_ALLOC;
   }
-
-  // if flags are 0: lookup the current key, but do not move the cursor!
-  if (unlikely(flags == 0)) {
-    assert(first_call_after_position == true);
-    /*
-      // skip the null-byte
-      KEY_PART_INFO *key_part = table->key_info[active_index].key_part;
-      if (key_part->null_bit) {
-        keybuf++;
-        keylen--;
-      }
-      ups_key_t key = ups_make_key((void *)keybuf, (uint16_t)keylen);
-      */
-    ups_key_t key = ups_make_key((void *)last_position_key.data(),
-                                 (uint16_t)last_position_key.size());
-    st = ups_cursor_find(cursor, &key, &record, 0);
-  }
-  // otherwise move forward or backwards (or whatever the caller requested)
-  else {
-    // if we fetched the record from an auto-generated index then store the
-    // row id; it will be required in ::position()
-    if (cattbl->autoidx.db != nullptr) {
-      ups_key_t key = ups_make_key(&recno_row_id, sizeof(recno_row_id));
-      key.flags = UPS_KEY_USER_ALLOC;
-      st = ups_cursor_move(cursor, &key, &record, flags);
-    }
-    // if we move to the next duplicate of a multipart index then check if the
-    // first (!) key of the multipart key is still identical to the previous
-    // one.
-    else if ((flags & UPS_ONLY_DUPLICATES) &&
-             table->key_info[active_index].user_defined_key_parts > 1) {
-      ups_key_t key = ups_make_key(nullptr, 0);
-      st = ups_cursor_move(cursor, &key, &record, flags & ~UPS_ONLY_DUPLICATES);
-      if (likely(st == 0 && keybuf != nullptr)) {
-        ups_key_t first = extract_first_keys(
-            keybuf, table, &table->key_info[active_index], key_arena);
-        if (::memcmp(key.data, first.data, first.size) != 0)
-          st = UPS_KEY_NOT_FOUND;
-      }
-    }
-    // otherwise simply move into the requested direction
-    else {
-      st = ups_cursor_move(cursor, nullptr, &record, flags);
-    }
-  }
-
+  // move into the requested direction
+  st = ups_cursor_move(current_cursor, nullptr, &record, flags);
   if (unlikely(st != 0))
     return ups_status_to_error(table, "ups_cursor_move", st);
 
   // if we fetched the record from a secondary index: lookup the actual row
   // from the primary index
-  if (!cattbl->indices.empty() &&
-      (active_index > 0 && active_index < MAX_KEY)) {
+  if ((active_index > 0 && active_index < MAX_KEY)) {
     ups_key_t key = ups_make_key(
         record.data,
         (uint16_t)record.size);  // 这个时候record.data是primary_key的值
@@ -2164,9 +1325,8 @@ int ha_sar::index_operation(uchar *keybuf, uint32_t, uchar *buf,
       rec.data = buf;
       rec.flags = UPS_RECORD_USER_ALLOC;
     }
-    st = ups_db_find(
-        cattbl->autoidx.db ? cattbl->autoidx.db : cattbl->indices[0].db,
-        nullptr, &key, &rec, 0);  // or autoidx.db??
+    st = ups_db_find(current_table->indices[0].db, get_tx_from_thd(ha_thd()),
+                     &key, &rec, 0);
     if (unlikely(st != 0))
       return ups_status_to_error(table, "ups_cursor_move", st);
 
@@ -2183,7 +1343,7 @@ int ha_sar::index_operation(uchar *keybuf, uint32_t, uchar *buf,
 int ha_sar::index_next(uchar *buf) {
   int rc;
   DBUG_ENTER("ha_sar::index_next");
-  rc = index_operation(nullptr, 0, buf, UPS_CURSOR_NEXT);
+  rc = index_operation(buf, UPS_CURSOR_NEXT);
   DBUG_RETURN(rc);
 }
 
@@ -2195,7 +1355,7 @@ int ha_sar::index_next(uchar *buf) {
 int ha_sar::index_prev(uchar *buf) {
   int rc;
   DBUG_ENTER("ha_sar::index_prev");
-  rc = index_operation(nullptr, 0, buf, UPS_CURSOR_PREVIOUS);
+  rc = index_operation(buf, UPS_CURSOR_PREVIOUS);
   DBUG_RETURN(rc);
 }
 
@@ -2212,7 +1372,7 @@ int ha_sar::index_prev(uchar *buf) {
 int ha_sar::index_first(uchar *buf) {
   int rc;
   DBUG_ENTER("ha_sar::index_first");
-  rc = index_operation(nullptr, 0, buf, UPS_CURSOR_FIRST);
+  rc = index_operation(buf, UPS_CURSOR_FIRST);
   DBUG_RETURN(rc);
 }
 
@@ -2229,30 +1389,29 @@ int ha_sar::index_first(uchar *buf) {
 int ha_sar::index_last(uchar *buf) {
   int rc;
   DBUG_ENTER("ha_sar::index_last");
-  rc = index_operation(nullptr, 0, buf, UPS_CURSOR_LAST);
+  rc = index_operation(buf, UPS_CURSOR_LAST);
   DBUG_RETURN(rc);
 }
 
-// 也许是不需要的
-int ha_sar::index_next_same(uchar *buf, const uchar *keybuf, uint keylen) {
-  DBUG_ENTER("ha_sar::index_next_same");
-
-  int rc = 0;
-
-  if (first_call_after_position) {
-    // locate the first key
-    rc = index_operation((uchar *)keybuf, keylen, buf, 0);
-    // and immediately try to move to the next key
-    if (likely(rc == 0))
-      rc = index_operation(nullptr, 0, buf,
-                           UPS_ONLY_DUPLICATES | UPS_CURSOR_NEXT);
-    first_call_after_position = false;
-  } else {
-    rc = index_operation((uchar *)keybuf, keylen, buf,
-                         UPS_ONLY_DUPLICATES | UPS_CURSOR_NEXT);
-  }
-  DBUG_RETURN(rc);
-}
+// int ha_sar::index_next_same(uchar *buf, const uchar *keybuf, uint keylen) {
+//  DBUG_ENTER("ha_sar::index_next_same");
+//
+//  int rc = 0;
+//
+//  if (first_call_after_position) {
+//    // locate the first key
+//    rc = index_operation((uchar *)keybuf, keylen, buf, 0);
+//    // and immediately try to move to the next key
+//    if (likely(rc == 0))
+//      rc = index_operation(nullptr, 0, buf,
+//                           UPS_ONLY_DUPLICATES | UPS_CURSOR_NEXT);
+//    first_call_after_position = false;
+//  } else {
+//    rc = index_operation((uchar *)keybuf, keylen, buf,
+//                         UPS_ONLY_DUPLICATES | UPS_CURSOR_NEXT);
+//  }
+//  DBUG_RETURN(rc);
+//}
 
 /**
   @brief
@@ -2268,20 +1427,37 @@ int ha_sar::index_next_same(uchar *buf, const uchar *keybuf, uint keylen) {
   filesort.cc, records.cc, sql_handler.cc, sql_select.cc, sql_table.cc and
   sql_update.cc
 */
-int ha_sar::rnd_init(bool) {
+int ha_sar::rnd_init(bool scan) {
   DBUG_ENTER("ha_sar::rnd_init");
 
-  assert(cattbl != nullptr);
+  ups_status_t st;
+  DBUG_ASSERT(current_table != nullptr);
+  if (scan) {
+    DBUG_ASSERT(current_cursor == nullptr);
+    DBUG_ASSERT(active_index == MAX_KEY);
+  }
+  if (!scan) {
+    DBUG_ASSERT(current_cursor != nullptr);
+    DBUG_ASSERT(active_index == 0);
+  }
+  DBUG_ASSERT(!current_table->indices.empty());
 
-  if (cursor) ups_cursor_close(cursor);
-
-  ups_db_t *db = cattbl->autoidx.db;
-  if (!db) db = cattbl->indices[0].db;
-
-  ups_status_t st = ups_cursor_create(&cursor, db, nullptr, 0);
-  if (unlikely(st != 0)) {
-    log_error("ups_cursor_create", st);
-    DBUG_RETURN(1);
+  if (scan) {
+    // 用primary key作为索引
+    ups_db_t *db = current_table->indices[0].db;
+    ups_txn_t *tx = get_tx_from_thd(ha_thd());
+    st = ups_cursor_create(&current_cursor, db, tx, 0);
+    if (unlikely(st != 0)) {
+      log_error("ups_cursor_create", st);
+      DBUG_RETURN(1);
+    }
+    active_index = 0;
+  } else {
+    st = ups_cursor_move(current_cursor, nullptr, nullptr, UPS_CURSOR_FIRST);
+    if (unlikely(st != 0)) {
+      log_error("ups_cursor_create", st);
+      DBUG_RETURN(1);
+    }
   }
 
   DBUG_RETURN(0);
@@ -2290,10 +1466,13 @@ int ha_sar::rnd_init(bool) {
 int ha_sar::rnd_end() {
   DBUG_ENTER("ha_sar::rnd_end");
 
-  assert(cursor != 0);
-  ups_cursor_close(cursor);
-  cursor = 0;
+  DBUG_ASSERT(current_table != nullptr);
+  DBUG_ASSERT(current_cursor != nullptr);
+  DBUG_ASSERT(active_index == 0);
 
+  ups_cursor_close(current_cursor);
+  current_cursor = nullptr;
+  active_index = MAX_KEY;
   DBUG_RETURN(0);
 }
 
@@ -2315,7 +1494,7 @@ int ha_sar::rnd_end() {
 int ha_sar::rnd_next(uchar *buf) {
   int rc;
   DBUG_ENTER("ha_sar::rnd_next");
-  rc = index_operation(nullptr, 0, buf, UPS_CURSOR_NEXT);
+  rc = index_operation(buf, UPS_CURSOR_NEXT);
   DBUG_RETURN(rc);
 }
 
@@ -2343,39 +1522,18 @@ int ha_sar::rnd_next(uchar *buf) {
 void ha_sar::position(const uchar *buf) {
   DBUG_ENTER("ha_sar::position");
 
-  // Auto-generated index? Then store the internal row-id (which is a 32bit
-  // record number)
-  if (cattbl->autoidx.db != nullptr) {
-    // assert(ref_length == sizeof(uint32_t));
-    *(uint32_t *)ref = recno_row_id;
-    DBUG_VOID_RETURN;
-  }
+  DBUG_ASSERT(active_index == 0);
+  DBUG_ASSERT(current_table != nullptr);
+  DBUG_ASSERT(current_cursor != nullptr);
 
   // Store the PRIMARY key as the reference in |ref|
   KEY *key_info = table->key_info;
-//  assert(
-//      ref_length ==
-//      key_info->key_length);  // table->key_info[0]，指向的是primary_key的info
-  key_copy(ref, (uchar *)buf, key_info, key_info->key_length);
+  DBUG_ASSERT(
+      ref_length ==
+      key_info->key_length);  // table->key_info[0]，指向的是primary_key的info
+  key_copy(ref, (uchar *)buf, key_info, ref_length);
 
-  // Same (index) key as in the last call? then return immediately (otherwise
-  // ups_cursor_find would reset the cursor to the first duplicate, and the
-  // following call to ha_sar::index_next_same() would always
-  // return the same row)
-  ups_key_t key = key_from_row(
-      table, buf, active_index == MAX_KEY ? 0 : active_index, key_arena);
-  if (key.size == last_position_key.size() &&
-      ::memcmp(key.data, last_position_key.data(), key.size) == 0) {
-    DBUG_VOID_RETURN;
-  }
-
-    // otherwise store a copy of the last key
-    last_position_key.resize(key.size);
-    ::memcpy(last_position_key.data(), key.data, key.size);
-
-    first_call_after_position = true;
-
-    DBUG_VOID_RETURN;
+  DBUG_VOID_RETURN;
 }
 
 /**
@@ -2394,38 +1552,8 @@ void ha_sar::position(const uchar *buf) {
 */
 int ha_sar::rnd_pos(uchar *buf, uchar *pos) {
   int rc;
-  ups_status_t st;
-
   DBUG_ENTER("ha_sar::rnd_pos");
-
-  assert(cattbl != nullptr);
-  assert(active_index == MAX_KEY);
-
-  bool is_fixed_row_length = row_is_fixed_length(table);
-  ups_record_t rec = ups_make_record(nullptr, 0);
-  ups_key_t key = ups_make_key(nullptr, 0);
-
-  ups_db_t *db = cattbl->autoidx.db; // 如果有primary_key是不会有autoidx的
-  if (!db) db = cattbl->indices[0].db;
-
-  // 要么是主键table->key_info[0].key_length，要么是自动生成的索引sizeof(uint32_t)
-  key.data = pos;
-  key.size = table->key_info ? (uint16_t)table->key_info[0].key_length
-                             : (uint16_t)sizeof(uint32_t);  // recno
-
-  // when reading from the primary index: directly fetch record into |buf|
-  // if the row has fixed length
-  if (is_fixed_row_length) {
-    rec.data = buf;
-    rec.flags = UPS_RECORD_USER_ALLOC;
-  }
-
-  st = ups_cursor_find(cursor, &key, &rec, 0);
-
-  // did we fetch from the primary index? then we have to unpack the record
-  if (st == 0 && !is_fixed_row_length) rec = unpack_record(table, &rec, buf);
-
-  rc = ups_status_to_error(table, "ups_cursor_find", st);
+  rc = index_read(buf, pos, ref_length, HA_READ_KEY_EXACT);
 
   DBUG_RETURN(rc);
 }
@@ -2468,14 +1596,10 @@ int ha_sar::rnd_pos(uchar *buf, uchar *pos) {
   sql_select.cc, sql_select.cc, sql_show.cc, sql_show.cc, sql_show.cc,
   sql_show.cc, sql_table.cc, sql_union.cc and sql_update.cc
 */
-int ha_sar::info(uint flag) {
+int ha_sar::info(uint flag __attribute__((unused))) {
   DBUG_ENTER("ha_sar::info");
 
-  if (flag & HA_STATUS_AUTO)
-    stats.auto_increment_value = cattbl->initial_autoinc_value;
-
-  if (flag & HA_STATUS_ERRKEY)
-    errkey = duplicate_error_index;
+  /// if (flag & HA_STATUS_ERRKEY) errkey = duplicate_error_index;
 
   // TODO stats.records = ???
   stats.records = 2;
@@ -2517,26 +1641,26 @@ int ha_sar::extra(enum ha_extra_function) {
   JOIN::reinit() in sql_select.cc and
   st_select_lex_unit::exec() in sql_union.cc.
 */
-int ha_sar::delete_all_rows() {
-  DBUG_ENTER("ha_sar::delete_all_rows");
-
-  close(); // closes the cursor
-
-  ups_status_t st = delete_all_databases(catdb, cattbl, table);
-  if (unlikely(st)) {
-    log_error("delete_all_databases", st);
-    DBUG_RETURN(1);
-  }
-
-  st = create_all_databases(catdb, cattbl, table);
-  if (unlikely(st)) {
-    log_error("create_all_databases", st);
-    DBUG_RETURN(1);
-  }
-
-  DBUG_RETURN(0);
-}
-
+// TODO
+// int ha_sar::delete_all_rows() {
+//  DBUG_ENTER("ha_sar::delete_all_rows");
+//
+//  // close();  // closes the cursor
+//
+//  ups_status_t st = delete_mysql_table(catdb, cattbl, table);
+//  if (unlikely(st)) {
+//    log_error("delete_mysql_table", st);
+//    DBUG_RETURN(1);
+//  }
+//
+//  st = create_mysql_table(catdb, cattbl, table);
+//  if (unlikely(st)) {
+//    log_error("create_mysql_table", st);
+//    DBUG_RETURN(1);
+//  }
+//
+//  DBUG_RETURN(0);
+//}
 
 /**
   @brief
@@ -2560,6 +1684,9 @@ int ha_sar::external_lock(THD *, int) {
   DBUG_ENTER("ha_sar::external_lock");
   DBUG_RETURN(0);
 }
+
+// 这表明我们不需要Mysql的表锁
+// uint ha_sar::lock_count() const { return 0; }
 
 /**
   @brief
@@ -2597,39 +1724,54 @@ int ha_sar::external_lock(THD *, int) {
 
   @see
   get_lock_data() in lock.cc
-  TODO
 */
-THR_LOCK_DATA **ha_sar::store_lock(THD *thd, THR_LOCK_DATA **to,
+THR_LOCK_DATA **ha_sar::store_lock(THD *thd __attribute__((unused)),
+                                   THR_LOCK_DATA **to,
                                    enum thr_lock_type lock_type) {
-    if (lock_type != TL_IGNORE && lock_data.type == TL_UNLOCK) {
-      /*
-        Here is where we get into the guts of a row level lock.
-        If TL_UNLOCK is set
-        If we are not doing a LOCK TABLE or DISCARD/IMPORT
-        TABLESPACE, then allow multiple writers
-      */
+  // TODO 这里用的是最基本的Mysql自带的表锁，可以参考MyRocks把他进行一定的转换，
+  //  用我们自己的锁
+  // store_lock是针对表的，给这张表加上Mysql表锁，锁的类型为lock_type，有好多个，
+  // 可以点进去看，级别从低到高，也可以不用他的表锁，innobase就没有用，直接把to给
+  // 返回来，也没有用lock_data，但是myrocks还是用了表锁，后面再改的时候要仔细考
+  // 虑一下
+  if (lock_type != TL_IGNORE && lock_data.type == TL_UNLOCK)
+    lock_data.type = lock_type;
+  *to++ = &lock_data;
+  return to;
 
-      if ((lock_type >= TL_WRITE_CONCURRENT_INSERT && lock_type <= TL_WRITE) &&
-          !thd_in_lock_tables(thd))
-        lock_type = TL_WRITE_ALLOW_WRITE;
-
-      /*
-        In queries of type INSERT INTO t1 SELECT ... FROM t2 ...
-        MySQL would use the lock TL_READ_NO_INSERT on t2, and that
-        would conflict with TL_WRITE_ALLOW_WRITE, blocking all inserts
-        to t2. Convert the lock to a normal read lock to allow
-        concurrent inserts to t2.
-      */
-
-      if (lock_type == TL_READ_NO_INSERT && !thd_in_lock_tables(thd))
-        lock_type = TL_READ;
-
-      lock_data.type = lock_type;
-    }
-
-    *to++ = &lock_data;
-
-    return to;
+  //  if (lock_type != TL_IGNORE && lock_data.type == TL_UNLOCK) {
+  //    /*
+  //      Here is where we get into the guts of a row level lock.
+  //      If TL_UNLOCK is set
+  //      If we are not doing a LOCK TABLE or DISCARD/IMPORT
+  //      TABLESPACE, then allow multiple writers
+  //    */
+  //
+  //    //
+  //    这里是直接copy过来的，不要改，虽然if语句里面的这些东西我不知道是在干什么，
+  //    // 特别是thd_in_lock_tables(thd)，千万不要删
+  //    if ((lock_type >= TL_WRITE_CONCURRENT_INSERT && lock_type <= TL_WRITE)
+  //    &&
+  //        !thd_in_lock_tables(thd))
+  //      lock_type = TL_WRITE_ALLOW_WRITE;
+  //
+  //    /*
+  //      In queries of type INSERT INTO t1 SELECT ... FROM t2 ...
+  //      MySQL would use the lock TL_READ_NO_INSERT on t2, and that
+  //      would conflict with TL_WRITE_ALLOW_WRITE, blocking all inserts
+  //      to t2. Convert the lock to a normal read lock to allow
+  //      concurrent inserts to t2.
+  //    */
+  //
+  //    if (lock_type == TL_READ_NO_INSERT && !thd_in_lock_tables(thd))
+  //      lock_type = TL_READ;
+  //
+  //    lock_data.type = lock_type;
+  //  }
+  //
+  //  *to++ = &lock_data;
+  //
+  //  return to;
 }
 
 /**
@@ -2654,18 +1796,13 @@ THR_LOCK_DATA **ha_sar::store_lock(THD *thd, THR_LOCK_DATA **to,
 int ha_sar::delete_table(const char *name, const dd::Table *) {
   DBUG_ENTER("ha_sar::delete_table");
 
-  std::string env_name = format_environment_name(name);
-  if (!catdb)
-    catdb = Catalogue::databases[env_name];
-
-  // remove the environment from the global cache
-  close_and_remove_share(name, catdb);
-
-//  // delete all files
-  (void)boost::filesystem::remove(env_name);
-  (void)boost::filesystem::remove(env_name + ".jrn0");
-  (void)boost::filesystem::remove(env_name + ".jrn1");
-  (void)boost::filesystem::remove(env_name + ".cnf");
+  ups_status_t st = delete_mysql_table(name);
+  if (unlikely(st != 0)) {
+    log_error("delete table", st);
+  }
+  if (current_cursor) current_cursor = nullptr;
+  active_index = MAX_KEY;
+  if (current_table != nullptr) current_table = nullptr;
 
   DBUG_RETURN(0);
 }
@@ -2708,123 +1845,125 @@ ha_rows ha_sar::records_in_range(uint, key_range *, key_range *) {
   DBUG_RETURN(10);  // low number to force index usage
 }
 
-
 struct st_mysql_storage_engine sar_storage_engine = {
     MYSQL_HANDLERTON_INTERFACE_VERSION};
 
-//static ulong srv_enum_var = 0;
-//static ulong srv_ulong_var = 0;
-//static double srv_double_var = 0;
-//static int srv_signed_int_var = 0;
-//static long srv_signed_long_var = 0;
-//static longlong srv_signed_longlong_var = 0;
+// static ulong srv_enum_var = 0;
+// static ulong srv_ulong_var = 0;
+// static double srv_double_var = 0;
+// static int srv_signed_int_var = 0;
+// static long srv_signed_long_var = 0;
+// static longlong srv_signed_longlong_var = 0;
 //
-//const char *enum_var_names[] = {"e1", "e2", NullS};
+// const char *enum_var_names[] = {"e1", "e2", NullS};
 //
-//TYPELIB enum_var_typelib = {array_elements(enum_var_names) - 1,
-//                            "enum_var_typelib", enum_var_names, NULL};
+// TYPELIB enum_var_typelib = {array_elements(enum_var_names) - 1,
+//                             "enum_var_typelib", enum_var_names, NULL};
 //
-//static MYSQL_SYSVAR_ENUM(enum_var,                        // name
-//                         srv_enum_var,                    // varname
-//                         PLUGIN_VAR_RQCMDARG,             // opt
-//                         "Sample ENUM system variable.",  // comment
-//                         NULL,                            // check
-//                         NULL,                            // update
-//                         0,                               // def
-//                         &enum_var_typelib);              // typelib
+// static MYSQL_SYSVAR_ENUM(enum_var,                        // name
+//                          srv_enum_var,                    // varname
+//                          PLUGIN_VAR_RQCMDARG,             // opt
+//                          "Sample ENUM system variable.",  // comment
+//                          NULL,                            // check
+//                          NULL,                            // update
+//                          0,                               // def
+//                          &enum_var_typelib);              // typelib
 //
-//static MYSQL_SYSVAR_ULONG(ulong_var, srv_ulong_var, PLUGIN_VAR_RQCMDARG,
-//                          "0..1000", NULL, NULL, 8, 0, 1000, 0);
+// static MYSQL_SYSVAR_ULONG(ulong_var, srv_ulong_var, PLUGIN_VAR_RQCMDARG,
+//                           "0..1000", NULL, NULL, 8, 0, 1000, 0);
 //
-//static MYSQL_SYSVAR_DOUBLE(double_var, srv_double_var, PLUGIN_VAR_RQCMDARG,
-//                           "0.500000..1000.500000", NULL, NULL, 8.5, 0.5,
-//                           1000.5,
-//                           0);  // reserved always 0
+// static MYSQL_SYSVAR_DOUBLE(double_var, srv_double_var, PLUGIN_VAR_RQCMDARG,
+//                            "0.500000..1000.500000", NULL, NULL, 8.5, 0.5,
+//                            1000.5,
+//                            0);  // reserved always 0
 //
-//static MYSQL_THDVAR_DOUBLE(double_thdvar, PLUGIN_VAR_RQCMDARG,
-//                           "0.500000..1000.500000", NULL, NULL, 8.5, 0.5,
-//                           1000.5, 0);
+// static MYSQL_THDVAR_DOUBLE(double_thdvar, PLUGIN_VAR_RQCMDARG,
+//                            "0.500000..1000.500000", NULL, NULL, 8.5, 0.5,
+//                            1000.5, 0);
 //
-//static MYSQL_SYSVAR_INT(signed_int_var, srv_signed_int_var, PLUGIN_VAR_RQCMDARG,
-//                        "INT_MIN..INT_MAX", NULL, NULL, -10, INT_MIN, INT_MAX,
-//                        0);
+// static MYSQL_SYSVAR_INT(signed_int_var, srv_signed_int_var,
+// PLUGIN_VAR_RQCMDARG,
+//                         "INT_MIN..INT_MAX", NULL, NULL, -10, INT_MIN,
+//                         INT_MAX, 0);
 //
-//static MYSQL_THDVAR_INT(signed_int_thdvar, PLUGIN_VAR_RQCMDARG,
-//                        "INT_MIN..INT_MAX", NULL, NULL, -10, INT_MIN, INT_MAX,
-//                        0);
+// static MYSQL_THDVAR_INT(signed_int_thdvar, PLUGIN_VAR_RQCMDARG,
+//                         "INT_MIN..INT_MAX", NULL, NULL, -10, INT_MIN,
+//                         INT_MAX, 0);
 //
-//static MYSQL_SYSVAR_LONG(signed_long_var, srv_signed_long_var,
-//                         PLUGIN_VAR_RQCMDARG, "LONG_MIN..LONG_MAX", NULL, NULL,
-//                         -10, LONG_MIN, LONG_MAX, 0);
+// static MYSQL_SYSVAR_LONG(signed_long_var, srv_signed_long_var,
+//                          PLUGIN_VAR_RQCMDARG, "LONG_MIN..LONG_MAX", NULL,
+//                          NULL, -10, LONG_MIN, LONG_MAX, 0);
 //
-//static MYSQL_THDVAR_LONG(signed_long_thdvar, PLUGIN_VAR_RQCMDARG,
-//                         "LONG_MIN..LONG_MAX", NULL, NULL, -10, LONG_MIN,
-//                         LONG_MAX, 0);
+// static MYSQL_THDVAR_LONG(signed_long_thdvar, PLUGIN_VAR_RQCMDARG,
+//                          "LONG_MIN..LONG_MAX", NULL, NULL, -10, LONG_MIN,
+//                          LONG_MAX, 0);
 //
-//static MYSQL_SYSVAR_LONGLONG(signed_longlong_var, srv_signed_longlong_var,
-//                             PLUGIN_VAR_RQCMDARG, "LLONG_MIN..LLONG_MAX", NULL,
-//                             NULL, -10, LLONG_MIN, LLONG_MAX, 0);
+// static MYSQL_SYSVAR_LONGLONG(signed_longlong_var, srv_signed_longlong_var,
+//                              PLUGIN_VAR_RQCMDARG, "LLONG_MIN..LLONG_MAX",
+//                              NULL, NULL, -10, LLONG_MIN, LLONG_MAX, 0);
 //
-//static MYSQL_THDVAR_LONGLONG(signed_longlong_thdvar, PLUGIN_VAR_RQCMDARG,
-//                             "LLONG_MIN..LLONG_MAX", NULL, NULL, -10, LLONG_MIN,
-//                             LLONG_MAX, 0);
+// static MYSQL_THDVAR_LONGLONG(signed_longlong_thdvar, PLUGIN_VAR_RQCMDARG,
+//                              "LLONG_MIN..LLONG_MAX", NULL, NULL, -10,
+//                              LLONG_MIN, LLONG_MAX, 0);
 //
-//static SYS_VAR *sar_system_variables[] = {MYSQL_SYSVAR(enum_var),
-//                                          MYSQL_SYSVAR(ulong_var),
-//                                          MYSQL_SYSVAR(double_var),
-//                                          MYSQL_SYSVAR(double_thdvar),
-//                                          MYSQL_SYSVAR(last_create_thdvar),
-//                                          MYSQL_SYSVAR(create_count_thdvar),
-//                                          MYSQL_SYSVAR(signed_int_var),
-//                                          MYSQL_SYSVAR(signed_int_thdvar),
-//                                          MYSQL_SYSVAR(signed_long_var),
-//                                          MYSQL_SYSVAR(signed_long_thdvar),
-//                                          MYSQL_SYSVAR(signed_longlong_var),
-//                                          MYSQL_SYSVAR(signed_longlong_thdvar),
-//                                          NULL};
+// static SYS_VAR *sar_system_variables[] = {MYSQL_SYSVAR(enum_var),
+//                                           MYSQL_SYSVAR(ulong_var),
+//                                           MYSQL_SYSVAR(double_var),
+//                                           MYSQL_SYSVAR(double_thdvar),
+//                                           MYSQL_SYSVAR(last_create_thdvar),
+//                                           MYSQL_SYSVAR(create_count_thdvar),
+//                                           MYSQL_SYSVAR(signed_int_var),
+//                                           MYSQL_SYSVAR(signed_int_thdvar),
+//                                           MYSQL_SYSVAR(signed_long_var),
+//                                           MYSQL_SYSVAR(signed_long_thdvar),
+//                                           MYSQL_SYSVAR(signed_longlong_var),
+//                                           MYSQL_SYSVAR(signed_longlong_thdvar),
+//                                           NULL};
 //
 //// this is an sar of SHOW_FUNC
-//static int show_func_sar(MYSQL_THD, SHOW_VAR *var, char *buf) {
-//  var->type = SHOW_CHAR;
-//  var->value = buf;  // it's of SHOW_VAR_FUNC_BUFF_SIZE bytes
-//  snprintf(buf, SHOW_VAR_FUNC_BUFF_SIZE,
-//           "enum_var is %lu, ulong_var is %lu, "
-//           "double_var is %f, signed_int_var is %d, "
-//           "signed_long_var is %ld, signed_longlong_var is %lld",
-//           srv_enum_var, srv_ulong_var, srv_double_var, srv_signed_int_var,
-//           srv_signed_long_var, srv_signed_longlong_var);
-//  return 0;
-//}
+// static int show_func_sar(MYSQL_THD, SHOW_VAR *var, char *buf) {
+//   var->type = SHOW_CHAR;
+//   var->value = buf;  // it's of SHOW_VAR_FUNC_BUFF_SIZE bytes
+//   snprintf(buf, SHOW_VAR_FUNC_BUFF_SIZE,
+//            "enum_var is %lu, ulong_var is %lu, "
+//            "double_var is %f, signed_int_var is %d, "
+//            "signed_long_var is %ld, signed_longlong_var is %lld",
+//            srv_enum_var, srv_ulong_var, srv_double_var, srv_signed_int_var,
+//            srv_signed_long_var, srv_signed_longlong_var);
+//   return 0;
+// }
 //
-//struct sar_vars_t {
-//  ulong var1;
-//  double var2;
-//  char var3[64];
-//  bool var4;
-//  bool var5;
-//  ulong var6;
-//};
+// struct sar_vars_t {
+//   ulong var1;
+//   double var2;
+//   char var3[64];
+//   bool var4;
+//   bool var5;
+//   ulong var6;
+// };
 //
-//sar_vars_t sar_vars = {100, 20.01, "three hundred", true, 0, 8250};
+// sar_vars_t sar_vars = {100, 20.01, "three hundred", true, 0, 8250};
 //
-//static SHOW_VAR show_status_sar[] = {
-//    {"var1", (char *)&sar_vars.var1, SHOW_LONG, SHOW_SCOPE_GLOBAL},
-//    {"var2", (char *)&sar_vars.var2, SHOW_DOUBLE, SHOW_SCOPE_GLOBAL},
-//    {0, 0, SHOW_UNDEF, SHOW_SCOPE_UNDEF}  // null terminator required
-//};
+// static SHOW_VAR show_status_sar[] = {
+//     {"var1", (char *)&sar_vars.var1, SHOW_LONG, SHOW_SCOPE_GLOBAL},
+//     {"var2", (char *)&sar_vars.var2, SHOW_DOUBLE, SHOW_SCOPE_GLOBAL},
+//     {0, 0, SHOW_UNDEF, SHOW_SCOPE_UNDEF}  // null terminator required
+// };
 //
-//static SHOW_VAR show_array_sar[] = {
-//    {"array", (char *)show_status_sar, SHOW_ARRAY, SHOW_SCOPE_GLOBAL},
-//    {"var3", (char *)&sar_vars.var3, SHOW_CHAR, SHOW_SCOPE_GLOBAL},
-//    {"var4", (char *)&sar_vars.var4, SHOW_BOOL, SHOW_SCOPE_GLOBAL},
-//    {0, 0, SHOW_UNDEF, SHOW_SCOPE_UNDEF}};
+// static SHOW_VAR show_array_sar[] = {
+//     {"array", (char *)show_status_sar, SHOW_ARRAY, SHOW_SCOPE_GLOBAL},
+//     {"var3", (char *)&sar_vars.var3, SHOW_CHAR, SHOW_SCOPE_GLOBAL},
+//     {"var4", (char *)&sar_vars.var4, SHOW_BOOL, SHOW_SCOPE_GLOBAL},
+//     {0, 0, SHOW_UNDEF, SHOW_SCOPE_UNDEF}};
 //
-//static SHOW_VAR func_status[] = {
-//    {"sar_func_sar", (char *)show_func_sar, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
-//    {"sar_status_var5", (char *)&sar_vars.var5, SHOW_BOOL, SHOW_SCOPE_GLOBAL},
-//    {"sar_status_var6", (char *)&sar_vars.var6, SHOW_LONG, SHOW_SCOPE_GLOBAL},
-//    {"sar_status", (char *)show_array_sar, SHOW_ARRAY, SHOW_SCOPE_GLOBAL},
-//    {0, 0, SHOW_UNDEF, SHOW_SCOPE_UNDEF}};
+// static SHOW_VAR func_status[] = {
+//     {"sar_func_sar", (char *)show_func_sar, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+//     {"sar_status_var5", (char *)&sar_vars.var5, SHOW_BOOL,
+//     SHOW_SCOPE_GLOBAL},
+//     {"sar_status_var6", (char *)&sar_vars.var6, SHOW_LONG,
+//     SHOW_SCOPE_GLOBAL},
+//     {"sar_status", (char *)show_array_sar, SHOW_ARRAY, SHOW_SCOPE_GLOBAL},
+//     {0, 0, SHOW_UNDEF, SHOW_SCOPE_UNDEF}};
 
 mysql_declare_plugin(sar){
     MYSQL_STORAGE_ENGINE_PLUGIN,
@@ -2834,11 +1973,11 @@ mysql_declare_plugin(sar){
     "SGX Enabled Remote storage engine",
     PLUGIN_LICENSE_GPL,
     sar_init_func, /* Plugin Init */
-    nullptr,          /* Plugin check uninstall */
-    NULL,          /* Plugin Deinit */ // TODO
+    nullptr,       /* Plugin check uninstall */
+    sar_uninstall_func, /* Plugin Deinit */
     0x0001 /* 0.1 */,
-    nullptr,          /* status variables */
+    nullptr, /* status variables */
     nullptr, /* system variables */
-    nullptr,                 /* config options */
-    0,                    /* flags */
+    nullptr, /* config options */
+    0,       /* flags */
 } mysql_declare_plugin_end;
