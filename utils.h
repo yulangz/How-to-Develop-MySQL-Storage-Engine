@@ -22,15 +22,7 @@ typedef std::vector<uint8_t> ByteVector;
 void log_error_impl(const char *file, int line, const char *function, ups_status_t st);
 #define log_error(f, s) log_error_impl(__FILE__, __LINE__, f, s)
 
-struct KeyPart {
-  explicit KeyPart(uint32_t type_ = 0, uint32_t length_ = 0)
-      : type(type_), length(length_) {}
-
-  uint32_t type;
-  uint32_t length;
-};
-
-// A class which aborts a transaction when it's destructed
+// Txn自动代理类，在析构的时候会自动abort这个txn（如果没有commit的话）
 struct TxnProxy {
   explicit TxnProxy(ups_env_t *env) {
     ups_status_t st = ups_txn_begin(&txn, env, nullptr, nullptr, 0);
@@ -65,7 +57,7 @@ struct TxnProxy {
   ups_txn_t *txn;
 };
 
-// A class which closes a cursor when going out of scope
+// Cursor自动代理类，在析构的时候会自动关闭这个Cursor
 struct CursorProxy {
   explicit CursorProxy(ups_cursor_t *c = nullptr) : cursor(c) {}
 

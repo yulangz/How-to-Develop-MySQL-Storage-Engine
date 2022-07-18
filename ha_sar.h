@@ -1,43 +1,3 @@
-/* Copyright (c) 2004, 2017, Oracle and/or its affiliates. All rights reserved.
-
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License, version 2.0,
-  as published by the Free Software Foundation.
-
-  This program is also distributed with certain software (including
-  but not limited to OpenSSL) that is licensed under separate terms,
-  as designated in a particular file or component or in included license
-  documentation.  The authors of MySQL hereby grant you an additional
-  permission to link the program and your derivative works with the
-  separately licensed software that they have included with MySQL.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License, version 2.0, for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program; if not, write to the Free Software
-  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
-
-/** @file ha_sar.h
-
-    @brief
-  The ha_sar engine is a stubbed storage engine for sar purposes only;
-  it does nothing at this point. Its purpose is to provide a source
-  code illustration of how to begin writing new storage engines; see also
-  /storage/sar/ha_sar.cc.
-
-    @note
-  Please read ha_sar.cc before reading this file.
-  Reminder: The sar storage engine implements all methods that are
-  *required* to be implemented. For a full list of all methods that you can
-  implement, see handler.h.
-
-   @see
-  /sql/handler.h and /storage/sar/ha_sar.cc
-*/
-
 #include <sys/types.h>
 
 #include "my_base.h" /* ha_rows */
@@ -47,9 +7,9 @@
 #include "thr_lock.h"    /* THR_LOCK, THR_LOCK_DATA */
 
 #include "catalogue.h"
-#include "utils.h"
-#include "record_pack.h"
 #include "key_process.h"
+#include "record_pack.h"
+#include "utils.h"
 
 /** @brief
   Sar_share is a class that will be shared among all open handlers.
@@ -75,13 +35,12 @@ class ha_sar : public handler {
   // 现在正在使用的cursor
   ups_cursor_t *current_cursor;
 
-  // Mutexes for locking (seem to be required)
+  // MySQL table lock，按照innodb里面的实现，这个是可以不需要的，暂时保留
   THR_LOCK_DATA lock_data;
 
-  // A memory buffer, to avoid frequent memory allocations
+  // 缓存key以及row的buffer，避免频繁的构造与析构
   ByteVector key_arena;
   ByteVector record_arena;
-
   ByteVector old_rec;
   ByteVector old_pk;
   ByteVector old_second_k;
@@ -102,14 +61,14 @@ class ha_sar : public handler {
   const char *table_type() const { return "SAR"; }
 
   /**
-    Replace key algorithm with one supported by SE, return the default key
-    algorithm for SE if explicit key algorithm was not provided.
-
-    @sa handler::adjust_index_algorithm().
+    存储引擎的默认索引类型
   */
   virtual enum ha_key_alg get_default_index_algorithm() const {
     return HA_KEY_ALG_BTREE;
   }
+  /**
+   * 存储引擎支持的索引，目前只支持B+树
+   */
   virtual bool is_index_algorithm_supported(enum ha_key_alg key_alg) const {
     return key_alg == HA_KEY_ALG_BTREE;
   }
@@ -119,11 +78,6 @@ class ha_sar : public handler {
     implements. The current table flags are documented in handler.h
   */
   ulonglong table_flags() const {
-    /*
-      We are saying that this engine is just statement capable to have
-      an engine that can only handle statement-based logging. This is
-      used in testing.
-    */
     return HA_NO_TRANSACTIONS      // TODO add transactions support
            | HA_NO_AUTO_INCREMENT  // TODO add auto increment support
            // | HA_MULTI_VALUED_KEY_SUPPORT  // TODO  do we need multi-valued
@@ -148,7 +102,10 @@ class ha_sar : public handler {
   ulong index_flags(uint inx MY_ATTRIBUTE((unused)),
                     uint part MY_ATTRIBUTE((unused)),
                     bool all_parts MY_ATTRIBUTE((unused))) const {
-    return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE;
+    return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE
+        // TODO　HA_DO_INDEX_COND_PUSHDOWN　待支持
+        // TODO HA_ONLY_WHOLE_INDEX ?什么意思
+        ;
   }
 
   /** @brief
@@ -187,123 +144,48 @@ class ha_sar : public handler {
     return std::numeric_limits<uint16_t>::max();
   }
 
-  /** @brief
-    Called in test_quick_select to determine if indexes should be used.
-  */
-  virtual double scan_time() { return (double)(stats.records) / 20.0 + 10; }
+  //  TODO 更精确的实现
+  //  /** @brief
+  //    Called in test_quick_select to determine if indexes should be used.
+  //  */
+  //  virtual double scan_time() { return (double)(stats.records) / 20.0 + 10; }
+  //
+  //  virtual double read_time(uint, uint, ha_rows rows) {
+  //    return (double)rows / 20.0 + 1;
+  //  }
 
-  /** @brief
-    This method will never be called if you do not implement indexes.
-  */
-  virtual double read_time(uint, uint, ha_rows rows) {
-    return (double)rows / 20.0 + 1;
-  }
 
-  /*
-    Everything below are methods that we implement in ha_sar.cc.
-
-    Most of these methods are not obligatory, skip them and
-    MySQL will treat them as not implemented
-  */
-  /** @brief
-    We implement this in ha_sar.cc; it's a required method.
-  */
+  int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info,
+             dd::Table *table_def);  ///< required
   int open(const char *name, int mode, uint test_if_locked,
-           const dd::Table *table_def);  // required
-
-  /** @brief
-    We implement this in ha_sar.cc; it's a required method.
-  */
-  int close();  // required
-
-  /** @brief
-    We implement this in ha_sar.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
+           const dd::Table *table_def);  ///< required
+  int close();  ///< required
   int write_row(uchar *buf);
-
-  /** @brief
-    We implement this in ha_sar.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int update_row(const uchar *old_data, uchar *new_data);
-
-  /** @brief
-    We implement this in ha_sar.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int delete_row(const uchar *buf);
-
-  public:
   int index_init(uint idx, bool sorted);
   int index_end();
-
-  public:
   virtual int index_read(uchar *buf, const uchar *key, uint key_len,
                          enum ha_rkey_function find_flag);
   int index_operation(uchar *buf, uint32_t flags);
- public:
-//  /** @brief
-//    We implement this in ha_sar.cc. It's not an obligatory method;
-//    skip it and and MySQL will treat it as not implemented.
-//  */
-//  int index_read_map(uchar *buf, const uchar *key, key_part_map keypart_map,
-//                     enum ha_rkey_function find_flag);
-
-  /** @brief
-    We implement this in ha_sar.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_next(uchar *buf);
-
-  // virtual int index_next_same(uchar *buf, const uchar *key, uint keylen);
-
- public:
-  /** @brief
-    We implement this in ha_sar.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_prev(uchar *buf);
-
-  /** @brief
-    We implement this in ha_sar.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_first(uchar *buf);
-
-  /** @brief
-    We implement this in ha_sar.cc. It's not an obligatory method;
-    skip it and and MySQL will treat it as not implemented.
-  */
   int index_last(uchar *buf);
-
-  /** @brief
-    Unlike index_init(), rnd_init() can be called two consecutive times
-    without rnd_end() in between (it only makes sense if scan=1). In this
-    case, the second call should prepare for the new table scan (e.g if
-    rnd_init() allocates the cursor, the second call should position the
-    cursor to the start of the table; no need to deallocate and allocate
-    it again. This is a required method.
-  */
-  int rnd_init(bool scan);  // required
-  int rnd_end();
+  int rnd_init(bool scan);  ///< required
+  int rnd_end();  /// <required
   int rnd_next(uchar *buf);             ///< required
   int rnd_pos(uchar *buf, uchar *pos);  ///< required
   void position(const uchar *record);   ///< required
   int info(uint);                       ///< required
   int extra(enum ha_extra_function operation);
   int external_lock(THD *thd, int lock_type);  ///< required
-  // int delete_all_rows(void);
   ha_rows records_in_range(uint inx, key_range *min_key, key_range *max_key);
   int delete_table(const char *from, const dd::Table *table_def);
   int rename_table(const char *from, const char *to,
                    const dd::Table *from_table_def, dd::Table *to_table_def);
-  int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info,
-             dd::Table *table_def);  ///< required
-
-//  uint lock_count() const;
+  //  uint lock_count() const;
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type);  ///< required
-
   int analyze(THD *, HA_CHECK_OPT *) { return HA_ADMIN_OK; };
 };

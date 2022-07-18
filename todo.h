@@ -18,6 +18,15 @@
 //  然后后面跟着几个 param 均为 {UPS_PARAM_KEY_TYPE, part_type}，表示Complex key的
 //  每一个part的实际type，然后在db中再挂一个CustomCompareState的属性用于后面比较
 #if 0
+
+struct KeyPart {
+  explicit KeyPart(uint32_t type_ = 0, uint32_t length_ = 0)
+      : type(type_), length(length_) {}
+
+  uint32_t type;
+  uint32_t length;
+};
+
 // 提取key中的key_part信息，应该是包括key的类型和长度
 struct CustomCompareState {
   CustomCompareState(KEY *key) {

@@ -11,6 +11,7 @@
 
 #include <ups/upscaledb.h>
 
+// 判断一个Mysql的row长度是不是固定的(是不是不包含变长字段)
 inline bool row_is_fixed_length(TABLE *table) {
   // table->s里面保存的是一个Table不变的一些信息
   return table->s->blob_fields + table->s->varchar_fields == 0;

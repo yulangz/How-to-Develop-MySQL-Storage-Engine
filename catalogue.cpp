@@ -29,8 +29,14 @@ ups_status_t EnvManager::free_table(const char *table_name) {
     return UPS_DATABASE_NOT_FOUND;
   }
 
+  // 删除与这个table相关的全部upsdb
   for (auto &index : table->indices) {
     uint16_t dbname = ups_db_get_name(index.db);
+    st = ups_db_close(index.db, UPS_AUTO_CLEANUP);
+    if (unlikely(st != 0)) {
+      log_error("ups_env_erase_db", st);
+      return st;
+    }
     st = ups_env_erase_db(env, dbname, 0);
     if (unlikely(st != 0)) {
       log_error("ups_env_erase_db", st);

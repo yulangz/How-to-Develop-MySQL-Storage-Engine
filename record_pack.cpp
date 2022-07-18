@@ -20,6 +20,7 @@ ups_record_t pack_record(TABLE *table, uint8_t *buf,
     src++;
   }
 
+  // 逐个字段复制
   for (Field **field = table->field; *field != nullptr; field++) {
     uint32_t size;
     uint32_t type = (*field)->type();
@@ -88,8 +89,7 @@ ups_record_t unpack_record(TABLE *table, ups_record_t *record,
     src++;
   }
 
-  uint32_t i = 0;
-  for (Field **field = table->field; *field != nullptr; field++, i++) {
+  for (Field **field = table->field; *field != nullptr; field++) {
     uint32_t size;
     uint32_t type = (*field)->type();
 

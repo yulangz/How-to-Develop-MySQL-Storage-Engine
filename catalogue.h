@@ -22,9 +22,7 @@
 
 namespace Catalogue {
 
-//
-// This struct stores information about a index
-//
+// 保持Index信息，一个Index会对应一个upsdb
 struct Index {
   explicit Index(ups_db_t *db_, int key_index_, bool is_primary_index_ = false,
                  uint32_t key_type_ = 0)
@@ -37,34 +35,23 @@ struct Index {
   // MySQL KEY info of this index
   // KEY *key_info;
 
-  // The upscaledb database structure
+  // upsdb
   ups_db_t *db;
-
   // 这是Table里面的第几个Key
   int key_index;
-
-  // |true| if this is the primary index
+  // 是否是主键
   bool is_primary_index;
-
-  // the upscaledb key type (UPS_TYPE_UINT32 etc)
+  // upscaledb key type (UPS_TYPE_UINT32 etc)
   uint32_t key_type;
-//
-//  inline bool enable_duplicate() const {
-//    return !(key_info->actual_flags & HA_NOSAME);
-//  }
 };
 
-//
-// This struct stores information about a MySQL table, its indices and the
-// associated upscaledb databases.
-//
+// 保存一个MySQL的Table，一个Table下有多个Index
 struct Table {
   explicit Table(std::string name_) : name(std::move(name_)) {}
 
   // table name, ./{db_name}/{table_name}
   std::string name;
 
-  // The table's indices
   // 一个Mysql Table有多个Index，每个Index对应一个upsDB的db
   std::vector<Index> indices;
 };
@@ -73,7 +60,9 @@ struct Table {
 // 追踪有哪些dbname被使用的类
 class DBNameTracker {
  public:
-  // 创建一个至多能追踪size个dbname的tracker
+  /**
+   * 创建一个至多能追踪size个dbname的tracker
+   */
   explicit DBNameTracker(uint16_t size);
 
   // 重置tracker，将所有dbname设置为free
@@ -88,16 +77,19 @@ class DBNameTracker {
   // 将一个dbname设置为free
   void free_dbname(uint16_t dbname);
 
+  // system table 的 dbname， system table的作用是保存每个Table的元信息，暂时未实现
   uint16_t system_db_name = 1;
  private:
   boost::dynamic_bitset<> name_track;
 };
 
-//
 // 管理整个UpsDB的Environment
-//
 class EnvManager {
  public:
+  /**
+   * @param env_ 被管理的env
+   * @param max_database env中最多允许的database数（是upsdb的database数）
+   */
   EnvManager(ups_env_t* env_, uint16_t max_database): env(env_), dbName_tracker(max_database) {}
 
   ~EnvManager() {
@@ -110,12 +102,12 @@ class EnvManager {
   // 根据名字删除Table，会同时删除相关的upsdb，把dbname加入到dbname_tracker
   ups_status_t free_table(const char* table_name);
 
-  // table_name => Table
   typedef std::map<std::string, boost::shared_ptr<Table> > TableMap;
+  // table_name => Table
   TableMap table_map;
+  // 避免多线程同时创建table
   boost::mutex lock;
 
-  // The upscaledb environment with all tables of this database
   ups_env_t *env;
 
   DBNameTracker dbName_tracker;
