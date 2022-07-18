@@ -47,9 +47,9 @@
 #include "thr_lock.h"    /* THR_LOCK, THR_LOCK_DATA */
 
 #include "catalogue.h"
-#include "configuration.h"
-
-typedef std::vector<uint8_t> ByteVector;
+#include "utils.h"
+#include "record_pack.h"
+#include "key_process.h"
 
 /** @brief
   Sar_share is a class that will be shared among all open handlers.
@@ -59,7 +59,7 @@ class Sar_share : public Handler_share {
  public:
   THR_LOCK lock;
   Sar_share() { thr_lock_init(&lock); };
-  ~Sar_share() { thr_lock_delete(&lock); }
+  ~Sar_share() override { thr_lock_delete(&lock); }
 };
 
 /** @brief
@@ -70,45 +70,31 @@ class ha_sar : public handler {
   Sar_share *share;        ///< Shared lock info
   Sar_share *get_share();  ///< Get the share
 
-  // The (global) Database object; stores the upscaledb environment
-  Catalogue::Database *catdb;
-
-  // The Table object
-  Catalogue::Table *cattbl;
+  // 当前正在使用的Table
+  boost::shared_ptr<Catalogue::Table> current_table;
+  // 现在正在使用的cursor
+  ups_cursor_t *current_cursor;
 
   // Mutexes for locking (seem to be required)
   THR_LOCK_DATA lock_data;
-
-  // A database cursor
-  ups_cursor_t *cursor;
-
-  // Is this the first call of |index_next_same()| after |position()|?
-  bool first_call_after_position;
-
-  // For caching the key in |position()|
-  ByteVector last_position_key;
 
   // A memory buffer, to avoid frequent memory allocations
   ByteVector key_arena;
   ByteVector record_arena;
 
-  // For storing the record number id of a row
-  uint32_t recno_row_id;
-
-  // The index which reported a duplicate key
-  uint32_t duplicate_error_index; // 这个的作用是什么？
+  ByteVector old_rec;
+  ByteVector old_pk;
+  ByteVector old_second_k;
+  ByteVector new_second_k;
 
  public:
   ha_sar(handlerton *hton, TABLE_SHARE *table_arg)
       : handler(hton, table_arg),
-        catdb(nullptr),
-        cattbl(nullptr),
-        cursor(nullptr),
-        first_call_after_position(false),
-        recno_row_id(0),
-        duplicate_error_index(0) {
+        current_table(nullptr),
+        current_cursor(nullptr) {
+    active_index = MAX_KEY;
   }
-  ~ha_sar() {}
+  ~ha_sar() override = default;
 
   /** @brief
     The name that will be used for display purposes.
@@ -228,7 +214,7 @@ class ha_sar : public handler {
   /** @brief
     We implement this in ha_sar.cc; it's a required method.
   */
-  int close(void);  // required
+  int close();  // required
 
   /** @brief
     We implement this in ha_sar.cc. It's not an obligatory method;
@@ -255,8 +241,7 @@ class ha_sar : public handler {
   public:
   virtual int index_read(uchar *buf, const uchar *key, uint key_len,
                          enum ha_rkey_function find_flag);
-  int index_operation(uchar *keybuf, uint32_t keylen,
-                          uchar *buf, uint32_t flags);
+  int index_operation(uchar *buf, uint32_t flags);
  public:
 //  /** @brief
 //    We implement this in ha_sar.cc. It's not an obligatory method;
@@ -271,8 +256,7 @@ class ha_sar : public handler {
   */
   int index_next(uchar *buf);
 
-  public:
-  virtual int index_next_same(uchar *buf, const uchar *key, uint keylen);
+  // virtual int index_next_same(uchar *buf, const uchar *key, uint keylen);
 
  public:
   /** @brief
@@ -309,7 +293,7 @@ class ha_sar : public handler {
   int info(uint);                       ///< required
   int extra(enum ha_extra_function operation);
   int external_lock(THD *thd, int lock_type);  ///< required
-  int delete_all_rows(void);
+  // int delete_all_rows(void);
   ha_rows records_in_range(uint inx, key_range *min_key, key_range *max_key);
   int delete_table(const char *from, const dd::Table *table_def);
   int rename_table(const char *from, const char *to,
@@ -317,6 +301,7 @@ class ha_sar : public handler {
   int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info,
              dd::Table *table_def);  ///< required
 
+//  uint lock_count() const;
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type);  ///< required
 
