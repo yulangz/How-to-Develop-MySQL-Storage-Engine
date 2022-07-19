@@ -55,6 +55,7 @@
 
 #include <boost/filesystem.hpp>
 
+#define REMOTE
 #ifdef REMOTE
 // TODO 用Mysql SysVar
 #define UPS_ENV_NAME "ups://localhost:8085/env.db"
@@ -1370,20 +1371,31 @@ int ha_sar::rnd_init(bool scan) {
 
   ups_status_t st;
   DBUG_ASSERT(current_table != nullptr);
-  if (!scan) {
-    // scan==false 表示是rnd_end前第一次调用rnd_init
+
+  if (scan) {
+    // 第一次调用，需要创建cursor
+    if (current_cursor == nullptr) {
+      DBUG_ASSERT(active_index == MAX_KEY);
+      // 用primary key作为索引
+      ups_db_t *db = current_table->indices[0].db;
+      ups_txn_t *tx = get_tx_from_thd(ha_thd());
+      st = ups_cursor_create(&current_cursor, db, tx, 0);
+      if (unlikely(st != 0)) {
+        log_error("ups_cursor_create", st);
+        DBUG_RETURN(1);
+      }
+      active_index = 0;
+    }
+    // 否则直接将cursor移动到头部。
+    st = ups_cursor_move(current_cursor, nullptr, nullptr, UPS_CURSOR_FIRST);
+    if (unlikely(st != 0)) {
+      log_error("ups_cursor_create", st);
+      DBUG_RETURN(1);
+    }
+  } else {
     DBUG_ASSERT(current_cursor == nullptr);
     DBUG_ASSERT(active_index == MAX_KEY);
-  } else {
-    // scan==true
-    // 表示不是rnd_end前第一次调用rnd_init，只需要把cursor指向表的开头即可
-    DBUG_ASSERT(current_cursor != nullptr);
-    DBUG_ASSERT(active_index == 0);
-  }
-  DBUG_ASSERT(!current_table->indices.empty());
 
-  if (!scan) {
-    // 用primary key作为索引
     ups_db_t *db = current_table->indices[0].db;
     ups_txn_t *tx = get_tx_from_thd(ha_thd());
     st = ups_cursor_create(&current_cursor, db, tx, 0);
@@ -1392,13 +1404,6 @@ int ha_sar::rnd_init(bool scan) {
       DBUG_RETURN(1);
     }
     active_index = 0;
-  } else {
-    // 将cursor指向表的开头
-    st = ups_cursor_move(current_cursor, nullptr, nullptr, UPS_CURSOR_FIRST);
-    if (unlikely(st != 0)) {
-      log_error("ups_cursor_create", st);
-      DBUG_RETURN(1);
-    }
   }
 
   DBUG_RETURN(0);
