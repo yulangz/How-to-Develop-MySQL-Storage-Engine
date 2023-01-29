@@ -9,12 +9,12 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-#include <boost/thread/mutex.hpp>
-#include <boost/dynamic_bitset.hpp>
+#include <bitset>
 
 #include <ups/upscaledb_int.h>
 #include <ups/upscaledb_srv.h>
+#include <atomic>
+#include <mutex>
 
 #include "sql/field.h"
 #include "sql/key.h"
@@ -80,7 +80,7 @@ class DBNameTracker {
   // system table 的 dbname， system table的作用是保存每个Table的元信息，暂时未实现
   uint16_t system_db_name = 1;
  private:
-  boost::dynamic_bitset<> name_track;
+  std::vector<bool> name_track;
 };
 
 // 管理整个UpsDB的Environment
@@ -97,20 +97,22 @@ class EnvManager {
   }
 
   // 根据Table名字，获取Table对象，该函数没有加锁，需要自己加锁
-  boost::shared_ptr<Table> get_table_from_name(const char* table_name);
+  std::shared_ptr<Table> get_table_from_name(const char* table_name);
 
   // 根据名字删除Table，会同时删除相关的upsdb，把dbname加入到dbname_tracker
   ups_status_t free_table(const char* table_name);
 
-  typedef std::map<std::string, boost::shared_ptr<Table> > TableMap;
+  typedef std::map<std::string, std::shared_ptr<Table> > TableMap;
   // table_name => Table
   TableMap table_map;
   // 避免多线程同时创建table
-  boost::mutex lock;
+  std::mutex lock;
 
   ups_env_t *env;
 
   DBNameTracker dbName_tracker;
+
+  std::atomic<ulonglong> trx_id_count{0};
 };
 
 extern EnvManager* env_manager;

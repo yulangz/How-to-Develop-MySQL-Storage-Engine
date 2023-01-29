@@ -13,7 +13,6 @@
 
 /** @brief
   Sar_share is a class that will be shared among all open handlers.
-  This sar implements the minimum of what you will probably need.
 */
 class Sar_share : public Handler_share {
  public:
@@ -31,9 +30,15 @@ class ha_sar : public handler {
   Sar_share *get_share();  ///< Get the share
 
   // 当前正在使用的Table
-  boost::shared_ptr<Catalogue::Table> current_table;
+  std::shared_ptr<Catalogue::Table> current_table;
   // 现在正在使用的cursor
   ups_cursor_t *current_cursor;
+  bool is_first_after_rnd_init; // 解决 rnd_init 后第一次读的问题
+
+  // 当前正在使用的txn
+  ups_txn_t *current_tx; // 理论上和 get_tx_from_thd(ha_thd()) 是一样的
+  ulonglong trx_id; // 当前trx的id，似乎不是必须的
+  bool is_registered;
 
   // MySQL table lock，按照innodb里面的实现，这个是可以不需要的，暂时保留
   THR_LOCK_DATA lock_data;
@@ -192,5 +197,6 @@ class ha_sar : public handler {
   THR_LOCK_DATA **store_lock(
       THD *thd, THR_LOCK_DATA **to,
       enum thr_lock_type lock_type) override;  ///< required
-  int analyze(THD *, HA_CHECK_OPT *) override { return HA_ADMIN_OK; };
+  int analyze(THD *, HA_CHECK_OPT *) override { return HA_ADMIN_OK; }
+  ups_txn_t *get_or_create_tx(THD *thd);
 };

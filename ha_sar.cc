@@ -53,9 +53,7 @@
 #include "sql/table.h"
 #include "typelib.h"
 
-#include <boost/filesystem.hpp>
-
-#define REMOTE
+// #define REMOTE
 #ifdef REMOTE
 // TODO 用Mysql SysVar
 #define UPS_ENV_NAME "ups://localhost:8085/env.db"
@@ -75,8 +73,13 @@ static ups_txn_t *get_tx_from_thd(THD *const thd) {
   return reinterpret_cast<ups_txn_t *>(thd_get_ha_data(thd, sar_hton));
 }
 
+// 从 thd 中删除当前连接的事务
+static void remove_tx_in_thd(THD *const thd) {
+  thd_set_ha_data(thd, sar_hton, nullptr);
+}
+
 // 从 thd 中获取当前连接的事务，如果没有事务则创建新的事务
-__attribute__((unused)) static ups_txn_t *get_or_create_tx(THD *const thd) {
+ups_txn_t *ha_sar::get_or_create_tx(THD *const thd) {
   ups_txn_t *tx = get_tx_from_thd(thd);
   if (tx == nullptr) {
     // create and start tx
@@ -86,6 +89,8 @@ __attribute__((unused)) static ups_txn_t *get_or_create_tx(THD *const thd) {
       log_error("ups_txn_begin", st);
     }
     thd_set_ha_data(thd, sar_hton, tx);
+    trx_id = Catalogue::env_manager->trx_id_count++;
+    is_registered = false;
   }
   return tx;
 }
@@ -123,7 +128,9 @@ static int sar_commit(handlerton *,    /*!< in/out: InnoDB handlerton */
   DBUG_ENTER("sar_commit");
   ups_status_t st = UPS_SUCCESS;
   if (commit_trx) {
+    DBUG_PRINT("commit", ("commit trx"));
     auto tx = get_tx_from_thd(thd);
+    remove_tx_in_thd(thd);
     st = ups_txn_commit(tx, 0);
     if (st != UPS_SUCCESS) {
       log_error("ups_txn_commit", st);
@@ -144,12 +151,17 @@ static int sar_rollback(handlerton *,      /*!< in/out: InnoDB handlerton */
 {
   DBUG_ENTER("sar_rollback");
   ups_status_t st = UPS_SUCCESS;
+  DBUG_PRINT("rollback", ("rollback trx with rollback_trx=%d", rollback_trx));
   if (rollback_trx) {
     auto tx = get_tx_from_thd(thd);
+    remove_tx_in_thd(thd);
     st = ups_txn_abort(tx, 0);
     if (st != UPS_SUCCESS) {
       log_error("ups_txn_abort", st);
     }
+  } else {
+    sql_print_error("savepoint not supported");
+    st = UPS_INTERNAL_ERROR;
   }
   DBUG_RETURN(st == UPS_SUCCESS ? 0 : 1);
 }
@@ -200,7 +212,7 @@ static int sar_init_func(void *p) {
   sar_hton->flags =
       HTON_TEMPORARY_NOT_SUPPORTED |
       HTON_SUPPORTS_EXTENDED_KEYS;  // TODO HTON_CAN_RECREATE?
-                                    // HTON_SUPPORTS_TABLE_ENCRYPTION?
+                                    //  HTON_SUPPORTS_TABLE_ENCRYPTION?
 
   sar_hton->is_supported_system_table =
       sar_is_supported_system_table;  // 具体作用并不是非常清楚，保留吧
@@ -213,11 +225,11 @@ static int sar_init_func(void *p) {
 static int sar_uninstall_func(void *p __attribute__((unused))) {
   DBUG_ENTER("sar_uninstall_func");
   Catalogue::env_manager->lock.lock();
-  ups_env_t *env = Catalogue::env_manager->env;
+  // ups_env_t *env = Catalogue::env_manager->env;
   Catalogue::env_manager->lock.unlock();
   delete Catalogue::env_manager;
   Catalogue::env_manager = nullptr;
-  ups_env_close(env, 0);
+  // ups_env_close(env, 0); // delete env_manager的时候已经关闭过了
   DBUG_RETURN(0);
 }
 
@@ -230,20 +242,19 @@ static inline bool key_exists(ups_db_t *db, ups_key_t *key) {
 
 // 删除一张Mysql表，删除upsdb中与这张表相关的全部内容，最后从env_manager内将其删除
 static ups_status_t delete_mysql_table(const char *table_name) {
-  boost::mutex::scoped_lock l(Catalogue::env_manager->lock);
+  std::unique_lock<std::mutex> l(Catalogue::env_manager->lock);
   return Catalogue::env_manager->free_table(table_name);
 }
 
 // 创建一张Mysql表，创建upsdb中与这张表相关的全部内容，并把这张表添加到env_manager内
 static ups_status_t create_mysql_table(const char *table_name, TABLE *table) {
-  boost::mutex::scoped_lock lock(Catalogue::env_manager->lock);
+  std::unique_lock<std::mutex> lock(Catalogue::env_manager->lock);
 
   ups_db_t *db;
   ups_status_t st;
   int num_indices = table->s->keys;
   bool has_primary_index = false;
-  boost::shared_ptr<Catalogue::Table> new_table(
-      new Catalogue::Table(table_name));
+  std::shared_ptr<Catalogue::Table> new_table(new Catalogue::Table(table_name));
   ups_env_t *env = Catalogue::env_manager->env;
 
   DBUG_ASSERT(num_indices > 0);
@@ -875,10 +886,9 @@ int ha_sar::write_row(uchar *buf) {
     // if (unlikely(rc == HA_ERR_FOUND_DUPP_KEY)) duplicate_error_index = 0;
     DBUG_RETURN(rc);
   }
-
-  int rc = insert_multiple_indices(current_table.get(), table, buf,
-                                   get_tx_from_thd(ha_thd()), key_arena,
-                                   record_arena);
+  DBUG_ASSERT(get_tx_from_thd(ha_thd()) == current_tx);
+  int rc = insert_multiple_indices(current_table.get(), table, buf, current_tx,
+                                   key_arena, record_arena);
   if (unlikely(rc)) DBUG_RETURN(rc);
 
   DBUG_RETURN(st == 0 ? 0 : 1);
@@ -902,7 +912,7 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
 
   ups_status_t st;
   ups_record_t new_rec = record_from_row(table, new_buf, record_arena);
-  ups_txn_t *tx = get_tx_from_thd(ha_thd());
+  ups_txn_t *tx = current_tx;
 
   DBUG_ASSERT(!current_table->indices.empty());
 
@@ -1103,7 +1113,7 @@ int ha_sar::delete_row(const uchar *buf) {
   // otherwise (if there are multiple indices) then delete the key from
   // each index
   int rc = delete_multiple_indices(table, current_table.get(), buf, key_arena,
-                                   get_tx_from_thd(ha_thd()));
+                                   current_tx);
   DBUG_RETURN(rc);
 }
 
@@ -1119,7 +1129,7 @@ int ha_sar::index_init(uint idx, bool) {
   active_index = idx;
   ups_db_t *db = current_table->indices[idx].db;
 
-  ups_txn_t *tx = get_tx_from_thd(ha_thd());
+  ups_txn_t *tx = current_tx;
   ups_status_t st = ups_cursor_create(&current_cursor, db, tx, 0);
   if (unlikely(st != 0)) {
     log_error("ups_cursor_create", st);
@@ -1291,8 +1301,8 @@ int ha_sar::index_read(uchar *buf, const uchar *key, uint,
         rec.data = buf;
         rec.flags = UPS_RECORD_USER_ALLOC;
       }
-      st = ups_db_find(current_table->indices[0].db, get_tx_from_thd(ha_thd()),
-                       &key_ups, &rec, 0);
+      st = ups_db_find(current_table->indices[0].db, current_tx, &key_ups, &rec,
+                       0);
       if (likely(st == 0) && !row_is_fixed_length(table))
         rec = unpack_record(table, &rec, buf);
     }
@@ -1334,8 +1344,7 @@ int ha_sar::index_operation(uchar *buf, uint32_t flags) {
       rec.data = buf;
       rec.flags = UPS_RECORD_USER_ALLOC;
     }
-    st = ups_db_find(current_table->indices[0].db, get_tx_from_thd(ha_thd()),
-                     &key, &rec, 0);
+    st = ups_db_find(current_table->indices[0].db, current_tx, &key, &rec, 0);
     if (unlikely(st != 0))
       return ups_status_to_error(table, "ups_cursor_move", st);
 
@@ -1413,20 +1422,22 @@ int ha_sar::index_last(uchar *buf) {
   rnd_init() allocates the cursor, the second call should position the
   cursor to the start of the table; no need to deallocate and allocate
   it again. This is a required method.
+  这里scan的意思是，scan=1，表示这个函数会多次调用（不管是其中的第几次），scan=0，表
+  示这个函数只会调用一次
 */
 int ha_sar::rnd_init(bool scan) {
   DBUG_ENTER("ha_sar::rnd_init");
-
   ups_status_t st;
   DBUG_ASSERT(current_table != nullptr);
 
+  is_first_after_rnd_init = true;
   if (scan) {
     // 第一次调用，需要创建cursor
     if (current_cursor == nullptr) {
       DBUG_ASSERT(active_index == MAX_KEY);
       // 用primary key作为索引
       ups_db_t *db = current_table->indices[0].db;
-      ups_txn_t *tx = get_tx_from_thd(ha_thd());
+      ups_txn_t *tx = current_tx;
       st = ups_cursor_create(&current_cursor, db, tx, 0);
       if (unlikely(st != 0)) {
         log_error("ups_cursor_create", st);
@@ -1445,7 +1456,7 @@ int ha_sar::rnd_init(bool scan) {
     DBUG_ASSERT(active_index == MAX_KEY);
 
     ups_db_t *db = current_table->indices[0].db;
-    ups_txn_t *tx = get_tx_from_thd(ha_thd());
+    ups_txn_t *tx = current_tx;
     st = ups_cursor_create(&current_cursor, db, tx, 0);
     if (unlikely(st != 0)) {
       log_error("ups_cursor_create", st);
@@ -1488,8 +1499,16 @@ int ha_sar::rnd_end() {
 */
 int ha_sar::rnd_next(uchar *buf) {
   int rc;
+  // 这里有个bug，rnd_init的时候 cursor 就已经指向了第一个 key，因此第一次调用
+  // rnd_next 的时候会返回第二个 key， 而mysql的读的逻辑是第一次调用 rnd_next
+  // 就返回第一个 key
   DBUG_ENTER("ha_sar::rnd_next");
-  rc = index_operation(buf, UPS_CURSOR_NEXT);
+  uint32_t flag = UPS_CURSOR_NEXT;
+  if (is_first_after_rnd_init) {
+    flag = UPS_CURSOR_FIRST;
+    is_first_after_rnd_init = false;
+  }
+  rc = index_operation(buf, flag);
   DBUG_RETURN(rc);
 }
 
@@ -1632,13 +1651,29 @@ int ha_sar::extra(enum ha_extra_function) {
   the section "locking functions for mysql" in lock.cc;
   copy_data_between_tables() in sql_table.cc.
 */
-int ha_sar::external_lock(THD *thd, int) {
+int ha_sar::external_lock(THD *thd, int lock_type) {
   DBUG_ENTER("ha_sar::external_lock");
   auto tx = get_or_create_tx(thd);
-  ulonglong trx_id = 0;
-  trans_register_ha(
-      thd, true, this->ht,
-      &trx_id);  // 第四个参数是线程id，似乎只是用来print（参考innodb中的实现），设置为0应该不会导致什么错误吧(?)
+  this->current_tx = tx;
+
+  if (lock_type != F_ULOCK) {
+    trans_register_ha(thd, false, this->ht, &trx_id);
+
+    // trans_register_ha 的第二个参数 all 的意思是，如果为
+    // true，则表示注册一个全新的事务（相当于 begin语句的意思）， 如果是
+    // false，则注册一个只针对当前语句(statement)的事务（相当于在当前语句前创建一个savepoint）。
+    // 我们不支持savepoint，但还是按照这个规则来。
+    // all 为 true的条件是：这个事务没有注册过，且 （非auto commit 模式 或是 begin语句）
+    bool all = !is_registered &&
+               (thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN));
+    if (all) {
+      trans_register_ha(thd, true, this->ht, &trx_id);
+    }
+    is_registered = true;
+    DBUG_PRINT("register",
+               ("register %llu trx to mysql with all=%d", trx_id, all));
+  }
+
   DBUG_RETURN(tx == nullptr ? 1 : 0);
 }
 
