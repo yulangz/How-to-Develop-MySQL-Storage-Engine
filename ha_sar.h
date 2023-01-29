@@ -58,18 +58,19 @@ class ha_sar : public handler {
   /** @brief
     The name that will be used for display purposes.
    */
-  const char *table_type() const { return "SAR"; }
+  const char *table_type() const override { return "SAR"; }
 
   /**
     存储引擎的默认索引类型
   */
-  virtual enum ha_key_alg get_default_index_algorithm() const {
+  enum ha_key_alg get_default_index_algorithm() const override {
     return HA_KEY_ALG_BTREE;
   }
   /**
    * 存储引擎支持的索引，目前只支持B+树
    */
-  virtual bool is_index_algorithm_supported(enum ha_key_alg key_alg) const {
+  bool is_index_algorithm_supported(
+      enum ha_key_alg key_alg) const override {
     return key_alg == HA_KEY_ALG_BTREE;
   }
 
@@ -77,7 +78,7 @@ class ha_sar : public handler {
     This is a list of flags that indicate what functionality the storage engine
     implements. The current table flags are documented in handler.h
   */
-  ulonglong table_flags() const {
+  ulonglong table_flags() const override {
     return HA_NO_TRANSACTIONS      // TODO add transactions support
            | HA_NO_AUTO_INCREMENT  // TODO add auto increment support
            // | HA_MULTI_VALUED_KEY_SUPPORT  // TODO  do we need multi-valued
@@ -101,7 +102,7 @@ class ha_sar : public handler {
   */
   ulong index_flags(uint inx MY_ATTRIBUTE((unused)),
                     uint part MY_ATTRIBUTE((unused)),
-                    bool all_parts MY_ATTRIBUTE((unused))) const {
+                    bool all_parts MY_ATTRIBUTE((unused))) const override {
     return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE
         // TODO　HA_DO_INDEX_COND_PUSHDOWN　待支持
         // TODO HA_ONLY_WHOLE_INDEX ?什么意思
@@ -115,21 +116,23 @@ class ha_sar : public handler {
     send. Return *real* limits of your storage engine here; MySQL will do
     min(your_limits, MySQL_limits) automatically.
    */
-  uint max_supported_record_length() const { return HA_MAX_REC_LENGTH; }
+  uint max_supported_record_length() const override {
+    return HA_MAX_REC_LENGTH;
+  }
 
   /** @brief
     unireg.cc will call this to make sure that the storage engine can handle
     the data it is about to send. Return *real* limits of your storage engine
     here; MySQL will do min(your_limits, MySQL_limits) automatically.
    */
-  uint max_supported_keys() const { return MAX_KEY; }
+  uint max_supported_keys() const override { return MAX_KEY; }
 
   /** @brief
     unireg.cc will call this to make sure that the storage engine can handle
     the data it is about to send. Return *real* limits of your storage engine
     here; MySQL will do min(your_limits, MySQL_limits) automatically.
    */
-  uint max_supported_key_parts() const { return MAX_REF_PARTS; }
+  uint max_supported_key_parts() const override { return MAX_REF_PARTS; }
 
   /** @brief
     unireg.cc will call this to make sure that the storage engine can handle
@@ -140,7 +143,7 @@ class ha_sar : public handler {
     There is no need to implement ..._key_... methods if your engine doesn't
     support indexes.
    */
-  uint max_supported_key_length() const {
+  uint max_supported_key_length() const override {
     return std::numeric_limits<uint16_t>::max();
   }
 
@@ -154,38 +157,40 @@ class ha_sar : public handler {
   //    return (double)rows / 20.0 + 1;
   //  }
 
-
   int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info,
-             dd::Table *table_def);  ///< required
+             dd::Table *table_def) override;  ///< required
   int open(const char *name, int mode, uint test_if_locked,
-           const dd::Table *table_def);  ///< required
-  int close();  ///< required
-  int write_row(uchar *buf);
-  int update_row(const uchar *old_data, uchar *new_data);
-  int delete_row(const uchar *buf);
-  int index_init(uint idx, bool sorted);
-  int index_end();
+           const dd::Table *table_def) override;  ///< required
+  int close() override;                           ///< required
+  int write_row(uchar *buf) override;
+  int update_row(const uchar *old_data, uchar *new_data) override;
+  int delete_row(const uchar *buf) override;
+  int index_init(uint idx, bool sorted) override;
+  int index_end() override;
   virtual int index_read(uchar *buf, const uchar *key, uint key_len,
-                         enum ha_rkey_function find_flag);
+                         enum ha_rkey_function find_flag) override;
   int index_operation(uchar *buf, uint32_t flags);
-  int index_next(uchar *buf);
-  int index_prev(uchar *buf);
-  int index_first(uchar *buf);
-  int index_last(uchar *buf);
-  int rnd_init(bool scan);  ///< required
-  int rnd_end();  /// <required
-  int rnd_next(uchar *buf);             ///< required
-  int rnd_pos(uchar *buf, uchar *pos);  ///< required
-  void position(const uchar *record);   ///< required
-  int info(uint);                       ///< required
-  int extra(enum ha_extra_function operation);
-  int external_lock(THD *thd, int lock_type);  ///< required
-  ha_rows records_in_range(uint inx, key_range *min_key, key_range *max_key);
-  int delete_table(const char *from, const dd::Table *table_def);
+  int index_next(uchar *buf) override;
+  int index_prev(uchar *buf) override;
+  int index_first(uchar *buf) override;
+  int index_last(uchar *buf) override;
+  int rnd_init(bool scan) override;              ///< required
+  int rnd_end() override;                        /// <required
+  int rnd_next(uchar *buf) override;             ///< required
+  int rnd_pos(uchar *buf, uchar *pos) override;  ///< required
+  void position(const uchar *record) override;   ///< required
+  int info(uint) override;                       ///< required
+  int extra(enum ha_extra_function operation) override;
+  int external_lock(THD *thd, int lock_type) override;  ///< required
+  ha_rows records_in_range(uint inx, key_range *min_key,
+                           key_range *max_key) override;
+  int delete_table(const char *from, const dd::Table *table_def) override;
   int rename_table(const char *from, const char *to,
-                   const dd::Table *from_table_def, dd::Table *to_table_def);
+                   const dd::Table *from_table_def,
+                   dd::Table *to_table_def) override;
   //  uint lock_count() const;
-  THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
-                             enum thr_lock_type lock_type);  ///< required
-  int analyze(THD *, HA_CHECK_OPT *) { return HA_ADMIN_OK; };
+  THR_LOCK_DATA **store_lock(
+      THD *thd, THR_LOCK_DATA **to,
+      enum thr_lock_type lock_type) override;  ///< required
+  int analyze(THD *, HA_CHECK_OPT *) override { return HA_ADMIN_OK; };
 };
