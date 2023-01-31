@@ -84,11 +84,11 @@ class ha_sar : public handler {
     implements. The current table flags are documented in handler.h
   */
   ulonglong table_flags() const override {
-    return HA_NO_TRANSACTIONS      // TODO add transactions support
-           | HA_NO_AUTO_INCREMENT  // TODO add auto increment support
+    return //HA_NO_TRANSACTIONS |      // TODO add transactions support
+           HA_NO_AUTO_INCREMENT |  // TODO add auto increment support
            // | HA_MULTI_VALUED_KEY_SUPPORT  // TODO  do we need multi-valued
            // key support?
-           | HA_TABLE_SCAN_ON_INDEX | HA_FAST_KEY_READ |
+           HA_TABLE_SCAN_ON_INDEX | HA_FAST_KEY_READ |
            HA_REQUIRE_PRIMARY_KEY | HA_PRIMARY_KEY_IN_READ_INDEX |
            HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
            HA_PRIMARY_KEY_REQUIRED_FOR_DELETE | HA_HAS_OWN_BINLOGGING |

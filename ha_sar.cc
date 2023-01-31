@@ -84,12 +84,12 @@ ups_txn_t *ha_sar::get_or_create_tx(THD *const thd) {
   if (tx == nullptr) {
     // create and start tx
     ups_status_t st;
-    st = ups_txn_begin(&tx, Catalogue::env_manager->env, nullptr, nullptr, 0);
+    st = ups_txn_begin(&tx, Catalogue::env_manager->get_env(), nullptr, nullptr, 0);
     if (st != UPS_SUCCESS) {
       log_error("ups_txn_begin", st);
     }
     thd_set_ha_data(thd, sar_hton, tx);
-    trx_id = Catalogue::env_manager->trx_id_count++;
+    trx_id = Catalogue::env_manager->next_trx();
     is_registered = false;
   }
   return tx;
@@ -175,8 +175,6 @@ static int sar_init_func(void *p) {
   ups_parameter_t params[] = {{0, 0}, {0, 0}, {0, 0}, {0, 0},
                               {0, 0}, {0, 0}, {0, 0}, {0, 0}};
   uint32_t flag = 0;
-  // ups_register_compare(CUSTOM_COMPARE_NAME, custom_compare_func);
-
   flag |= UPS_ENABLE_TRANSACTIONS;
   //  flag |= UPS_DISABLE_RECOVERY;
   //  flag |= UPS_CACHE_UNLIMITED;
@@ -187,9 +185,9 @@ static int sar_init_func(void *p) {
 #ifdef REMOTE
   st = ups_env_open(&env, UPS_ENV_NAME, flag, params);
 #else
-  st = ups_env_open(&env, UPS_ENV_NAME, flag, params);
+  st = ups_env_open(&env, UPS_ENV_NAME, flag | UPS_AUTO_RECOVERY, params);
   if (st == UPS_FILE_NOT_FOUND)
-    st = ups_env_create(&env, UPS_ENV_NAME, flag, UPS_ENV_MODE, params);
+    st = ups_env_create(&env, UPS_ENV_NAME, flag | UPS_ENABLE_FSYNC, UPS_ENV_MODE, params);
 #endif
 
   if (st != UPS_SUCCESS) {
@@ -224,12 +222,8 @@ static int sar_init_func(void *p) {
 
 static int sar_uninstall_func(void *p __attribute__((unused))) {
   DBUG_ENTER("sar_uninstall_func");
-  Catalogue::env_manager->lock.lock();
-  // ups_env_t *env = Catalogue::env_manager->env;
-  Catalogue::env_manager->lock.unlock();
   delete Catalogue::env_manager;
   Catalogue::env_manager = nullptr;
-  // ups_env_close(env, 0); // delete env_manager的时候已经关闭过了
   DBUG_RETURN(0);
 }
 
@@ -242,33 +236,29 @@ static inline bool key_exists(ups_db_t *db, ups_key_t *key) {
 
 // 删除一张Mysql表，删除upsdb中与这张表相关的全部内容，最后从env_manager内将其删除
 static ups_status_t delete_mysql_table(const char *table_name) {
-  std::unique_lock<std::mutex> l(Catalogue::env_manager->lock);
   return Catalogue::env_manager->free_table(table_name);
 }
 
 // 创建一张Mysql表，创建upsdb中与这张表相关的全部内容，并把这张表添加到env_manager内
 static ups_status_t create_mysql_table(const char *table_name, TABLE *table) {
-  std::unique_lock<std::mutex> lock(Catalogue::env_manager->lock);
+  //std::unique_lock<std::mutex> lock(Catalogue::env_manager->lock);
 
   ups_db_t *db;
   ups_status_t st;
   int num_indices = table->s->keys;
   bool has_primary_index = false;
   std::shared_ptr<Catalogue::Table> new_table(new Catalogue::Table(table_name));
-  ups_env_t *env = Catalogue::env_manager->env;
+  ups_env_t *env = Catalogue::env_manager->get_env();
 
   DBUG_ASSERT(num_indices > 0);
   std::vector<uint16_t> dbnames(num_indices);
   for (int i = 0; i < num_indices; ++i) {
-    dbnames[i] = Catalogue::env_manager->dbName_tracker.get_new_dbname();
+    dbnames[i] = Catalogue::env_manager->get_new_db_name();
     if (unlikely(dbnames[i] == 0)) {
       sql_print_error("no more ups database could be use.");
       return UPS_LIMITS_REACHED;
     }
   }
-
-  // 在创建db的时候可以把lock解锁
-  lock.unlock();
 
   // key info for the primary key
   std::pair<uint32_t, uint32_t> primary_type_info;
@@ -349,9 +339,8 @@ static ups_status_t create_mysql_table(const char *table_name, TABLE *table) {
   }
 
   DBUG_ASSERT(has_primary_index == true);
-  // 把new_table放到env_manager里面，需要重新加锁
-  lock.lock();
-  Catalogue::env_manager->table_map.emplace(table_name, new_table);
+  // 把new_table放到env_manager里面
+  Catalogue::env_manager->add_table(table_name, new_table);
   return 0;
 }
 
@@ -484,13 +473,10 @@ int ha_sar::open(const char *name, int, uint, const dd::Table *) {
   if (unlikely(!share)) DBUG_RETURN(1);
   thr_lock_data_init(&share->lock, &lock_data, nullptr);
 
-  // ups_register_compare(CUSTOM_COMPARE_NAME, custom_compare_func);
   ups_set_committed_flush_threshold(30);
   record_arena.resize(table->s->rec_buff_length);
 
-  Catalogue::env_manager->lock.lock();
   current_table = Catalogue::env_manager->get_table_from_name(name);
-  Catalogue::env_manager->lock.unlock();
 
   if (!current_table) {
     sql_print_error("table %s not found", name);
@@ -932,7 +918,7 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
     // if both keys are equal: simply overwrite the record of the
     // current key
     if (equal) {
-      st = ups_db_insert(current_table->indices[0].db, nullptr, &oldkey,
+      st = ups_db_insert(current_table->indices[0].db, tx, &oldkey,
                          &new_rec, UPS_OVERWRITE);
       if (unlikely(st != 0)) {
         log_error("ups_cursor_overwrite", st);
@@ -1445,12 +1431,13 @@ int ha_sar::rnd_init(bool scan) {
       }
       active_index = 0;
     }
-    // 否则直接将cursor移动到头部。
-    st = ups_cursor_move(current_cursor, nullptr, nullptr, UPS_CURSOR_FIRST);
-    if (unlikely(st != 0)) {
-      log_error("ups_cursor_create", st);
-      DBUG_RETURN(1);
-    }
+    // 否则表示需要将cursor从头开始再次扫描，直接将 is_first_after_rnd_init 设置为 true 即可做到，前面已经做了这一点了
+
+//    st = ups_cursor_move(current_cursor, nullptr, nullptr, UPS_CURSOR_FIRST);
+//    if (unlikely(st != 0)) {
+//      log_error("ups_cursor_create", st);
+//      DBUG_RETURN(1);
+//    }
   } else {
     DBUG_ASSERT(current_cursor == nullptr);
     DBUG_ASSERT(active_index == MAX_KEY);
@@ -1653,21 +1640,24 @@ int ha_sar::extra(enum ha_extra_function) {
 */
 int ha_sar::external_lock(THD *thd, int lock_type) {
   DBUG_ENTER("ha_sar::external_lock");
+  DBUG_PRINT("external lock", ("lock_type = %d", lock_type));
   auto tx = get_or_create_tx(thd);
   this->current_tx = tx;
 
-  if (lock_type != F_ULOCK) {
-    trans_register_ha(thd, false, this->ht, &trx_id);
-
+  // if (lock_type != F_ULOCK) { 是下面这个宏不是上面这个！！！
+  if (lock_type != F_UNLCK) {
     // trans_register_ha 的第二个参数 all 的意思是，如果为
     // true，则表示注册一个全新的事务（相当于 begin语句的意思）， 如果是
     // false，则注册一个只针对当前语句(statement)的事务（相当于在当前语句前创建一个savepoint）。
     // 我们不支持savepoint，但还是按照这个规则来。
-    // all 为 true的条件是：这个事务没有注册过，且 （非auto commit 模式 或是 begin语句）
+    // all 为 true的条件是：这个事务没有注册过，且 （非auto commit 模式 或是
+    // begin语句）
     bool all = !is_registered &&
                (thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN));
     if (all) {
       trans_register_ha(thd, true, this->ht, &trx_id);
+    } else {
+      trans_register_ha(thd, false, this->ht, &trx_id);
     }
     is_registered = true;
     DBUG_PRINT("register",
