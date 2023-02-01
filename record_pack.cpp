@@ -165,6 +165,7 @@ void extract_varchar_field_info(Field *field, uint32_t *len_bytes,
     *len_bytes = 2;
     return;
   }
+  // 理论上不会出现下面两种情况
   if (likely(field->field_length <= 16777215)) {
     *field_size = (src[2] << 16) | (src[1] << 8) | (src[0] << 0);
     *len_bytes = 3;

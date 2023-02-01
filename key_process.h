@@ -12,8 +12,8 @@
 
 #include "utils.h"
 
-// 返回一个type类型的field的前缀长度，blob何text类型不应该由此判断
-inline int encoded_length_bytes(uint8 type) {
+// 返回一个type类型的field的前缀长度
+inline int length_bytes_len(uint8 type) {
   if (type == HA_KEYTYPE_VARTEXT1 || type == HA_KEYTYPE_VARBINARY1) return 1;
   if (type == HA_KEYTYPE_VARTEXT2 || type == HA_KEYTYPE_VARBINARY2) return 2;
   return 0;
@@ -29,15 +29,22 @@ int table_field_info(KEY_PART_INFO *key_part, uint32_t &key, uint32_t &size);
 // return <key, size>
 // 如果index只有1个字段，key是这个字段相应的ups_type，size是对应的字节大小
 // 返回值：如果是可以做索引的字段，返回1,否则返回0
-// 若果index包含多个字段，会返回复合键类型(Complex)，暂时不支持，返回1
+// 可以支持多列索引，返回的 key 类型为 UPS_TYPE_BINARY
 int table_key_info(KEY *key_info, uint32_t &key, uint32_t &size,
-                   __attribute__((unused))
                    std::vector<std::pair<uint32_t, uint32_t>> *key_parts);
 
-// 从一个行数据中提取出一个key_part(field)的数据，生成ups_key_t
+// 从一个行数据中提取出一个 key_part(field) 的数据，生成 ups_key_t
+// @param buf 一行的数据
+// @param key_part 这个key_part(field)的类型信息
 ups_key_t field_from_row(const uchar *buf, KEY_PART_INFO *key_part);
 
-// buf指向一个行，提取其中第index个KEY(可能包含多个Field)的值，生成ups_key_t
+// 将 key 转换为 memcomparable 格式
+// @param key_part 这个key_part(field)的类型信息
+// @param key 实际的这一行的key数据
+// @param arena 缓冲，会将 convert 后的 key 数据添加到 arena 后面
+void convert_field_to_mem(KEY_PART_INFO *key_part, ups_key_t key, ByteVector &arena);
+
+// buf 指向一个行，提取其中第 index 个 KEY(可能包含多个 Field )的值，生成 ups_key_t
 ups_key_t key_from_row(const uchar *buf,  KEY* key_info,
                        ByteVector &arena);
 

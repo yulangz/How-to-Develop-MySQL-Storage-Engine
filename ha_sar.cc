@@ -744,7 +744,7 @@ static ups_key_t extract_key(const uint8_t *keybuf, KEY *key_info,
 
   // if this is not a multi-part key AND it has fixed length then we can
   // simply use the existing |keybuf| pointer for the lookup
-  if (key_parts == 1 && encoded_length_bytes(key_part->type) == 0) {
+  if (key_parts == 1 && length_bytes_len(key_part->type) == 0) {
     key.data = key_part->null_bit ? (void *)(keybuf + 1) : (void *)keybuf;
     key.size = key_part->length;
   }
@@ -760,7 +760,7 @@ static ups_key_t extract_key(const uint8_t *keybuf, KEY *key_info,
       if (key_part->null_bit) p++;
 
       uint32_t length;
-      switch (encoded_length_bytes(key_part->type)) {
+      switch (length_bytes_len(key_part->type)) {
         case 0:
           length = key_part->length;
           break;
@@ -813,7 +813,7 @@ static ups_key_t extract_first_keys(const uint8_t *keybuf, TABLE *table,
     if (key_part->null_bit) p++;
 
     uint32_t length;
-    switch (encoded_length_bytes(key_part->type)) {
+    switch (length_bytes_len(key_part->type)) {
       case 0:
         length = key_part->length;
         break;
