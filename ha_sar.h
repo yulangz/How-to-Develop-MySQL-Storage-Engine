@@ -172,8 +172,11 @@ class ha_sar : public handler {
   int delete_row(const uchar *buf) override;
   int index_init(uint idx, bool sorted) override;
   int index_end() override;
-  virtual int index_read(uchar *buf, const uchar *key, uint key_len,
-                         enum ha_rkey_function find_flag) override;
+//  int index_read(uchar *buf, const uchar *key, uint key_len,
+//                         enum ha_rkey_function find_flag) override;
+  int index_read_map(uchar *buf, const uchar *key,
+                 key_part_map keypart_map,
+                 enum ha_rkey_function find_flag) override;
   int index_operation(uchar *buf, uint32_t flags);
   int index_next(uchar *buf) override;
   int index_prev(uchar *buf) override;
