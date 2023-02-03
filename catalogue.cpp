@@ -75,7 +75,7 @@ ups_status_t EnvManager::flush_all_tables() {
       memcpy(index_arena.data() + i * BytePerIndexRecord + 2, &index.key_index,
              4);
       memcpy(index_arena.data() + i * BytePerIndexRecord + 6,
-             &index.is_primary_index, 1);
+             &index.index_key_type, 1);
       memcpy(index_arena.data() + i * BytePerIndexRecord + 7, &index.key_type,
              4);
     }
@@ -94,6 +94,23 @@ ups_status_t EnvManager::flush_all_tables() {
   return st;
 }
 
+static uint64 get_next_key(ups_db_t *db) {
+  ups_status_t st;
+  uint64 v = UINT64_MAX;
+  ups_key_t key = ups_make_key(&v, sizeof(v));
+  key.flags |= UPS_KEY_USER_ALLOC;
+  CursorProxy c(db, nullptr);
+  st = ups_cursor_move(c.cursor, &key, nullptr, UPS_CURSOR_LAST);
+  if (st == UPS_SUCCESS) {
+    return v + 1;
+  } else {
+    if (st != UPS_KEY_NOT_FOUND) {
+      log_error("get last key", st);
+    }
+    return 0;
+  }
+}
+
 ups_status_t EnvManager::read_all_tables() {
   ups_status_t st = UPS_SUCCESS;
   ups_key_t k = ups_make_key(0,0);
@@ -109,11 +126,11 @@ ups_status_t EnvManager::read_all_tables() {
     for (size_t i = 0;i < index_num; i++) {
       uint16_t db_name;
       int key_index;
-      bool is_pk;
+      enum key_type index_key_type;
       uint32_t key_type;
       memcpy(&db_name, (char*)r.data + i * BytePerIndexRecord + 0, 2);
       memcpy(&key_index, (char*)r.data + i * BytePerIndexRecord + 2, 4);
-      memcpy(&is_pk, (char*)r.data + i * BytePerIndexRecord + 6, 1);
+      memcpy(&index_key_type, (char*)r.data + i * BytePerIndexRecord + 6, 1);
       memcpy(&key_type, (char*)r.data + i * BytePerIndexRecord + 7, 4);
       ups_db_t *db;
       st = ups_env_open_db(env, &db, db_name, 0, nullptr);
@@ -122,8 +139,12 @@ ups_status_t EnvManager::read_all_tables() {
         return st;
       }
       dbName_tracker.set_used(db_name);
-      Index new_index(db, key_index, is_pk, key_type);
+      Index new_index(db, key_index, index_key_type, key_type);
       new_table->indices.push_back(new_index);
+
+      if (index_key_type == KEY_TYPE_HIDDEN_PRIMARY) {
+        new_table->hidden_index_value = get_next_key(db);
+      }
     }
     table_map[table_name] = new_table;
     st = ups_cursor_move(cursorProxy.cursor, &k, &r, UPS_CURSOR_NEXT);

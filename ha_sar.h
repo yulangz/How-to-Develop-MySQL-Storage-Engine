@@ -33,11 +33,11 @@ class ha_sar : public handler {
   std::shared_ptr<Catalogue::Table> current_table;
   // 现在正在使用的cursor
   ups_cursor_t *current_cursor;
-  bool is_first_after_rnd_init; // 解决 rnd_init 后第一次读的问题
+  bool is_first_after_rnd_init;  // 解决 rnd_init 后第一次读的问题
 
   // 当前正在使用的txn
-  ups_txn_t *current_tx; // 理论上和 get_tx_from_thd(ha_thd()) 是一样的
-  ulonglong trx_id; // 当前trx的id，似乎不是必须的
+  ups_txn_t *current_tx;  // 理论上和 get_tx_from_thd(ha_thd()) 是一样的
+  ulonglong trx_id;       // 当前trx的id，似乎不是必须的
   bool is_registered;
 
   // MySQL table lock，按照innodb里面的实现，这个是可以不需要的，暂时保留
@@ -74,8 +74,7 @@ class ha_sar : public handler {
   /**
    * 存储引擎支持的索引，目前只支持B+树
    */
-  bool is_index_algorithm_supported(
-      enum ha_key_alg key_alg) const override {
+  bool is_index_algorithm_supported(enum ha_key_alg key_alg) const override {
     return key_alg == HA_KEY_ALG_BTREE;
   }
 
@@ -84,15 +83,15 @@ class ha_sar : public handler {
     implements. The current table flags are documented in handler.h
   */
   ulonglong table_flags() const override {
-    return //HA_NO_TRANSACTIONS |      // TODO add transactions support
-           HA_NO_AUTO_INCREMENT |  // TODO add auto increment support
-           // | HA_MULTI_VALUED_KEY_SUPPORT  // TODO  do we need multi-valued
-           // key support?
-           HA_TABLE_SCAN_ON_INDEX | HA_FAST_KEY_READ |
-           HA_REQUIRE_PRIMARY_KEY | HA_PRIMARY_KEY_IN_READ_INDEX |
-           HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
-           HA_PRIMARY_KEY_REQUIRED_FOR_DELETE | HA_HAS_OWN_BINLOGGING |
-           HA_BINLOG_FLAGS | HA_NO_READ_LOCAL_LOCK | HA_GENERATED_COLUMNS;
+    return  // HA_NO_TRANSACTIONS |      //
+            // HA_NO_AUTO_INCREMENT |  //
+        // HA_MULTI_VALUED_KEY_SUPPORT
+        // key support?
+        HA_TABLE_SCAN_ON_INDEX | HA_FAST_KEY_READ |
+        // HA_REQUIRE_PRIMARY_KEY |
+        HA_PRIMARY_KEY_IN_READ_INDEX | HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
+        HA_PRIMARY_KEY_REQUIRED_FOR_DELETE | HA_HAS_OWN_BINLOGGING |
+        HA_BINLOG_FLAGS | HA_NO_READ_LOCAL_LOCK | HA_GENERATED_COLUMNS;
   }
 
   /** @brief
@@ -172,11 +171,10 @@ class ha_sar : public handler {
   int delete_row(const uchar *buf) override;
   int index_init(uint idx, bool sorted) override;
   int index_end() override;
-//  int index_read(uchar *buf, const uchar *key, uint key_len,
-//                         enum ha_rkey_function find_flag) override;
-  int index_read_map(uchar *buf, const uchar *key,
-                 key_part_map keypart_map,
-                 enum ha_rkey_function find_flag) override;
+  //  int index_read(uchar *buf, const uchar *key, uint key_len,
+  //                         enum ha_rkey_function find_flag) override;
+  int index_read_map(uchar *buf, const uchar *key, key_part_map keypart_map,
+                     enum ha_rkey_function find_flag) override;
   int index_operation(uchar *buf, uint32_t flags);
   int index_next(uchar *buf) override;
   int index_prev(uchar *buf) override;

@@ -98,6 +98,7 @@ ups_txn_t *ha_sar::get_or_create_tx(THD *const thd) {
 
 // 返回第idx个key的key_info
 static inline KEY *get_key_info(TABLE *table, int idx) {
+  if (idx == MAX_KEY) return nullptr;  // hidden key
   return &(table->key_info[idx]);
 }
 
@@ -209,10 +210,10 @@ static int sar_init_func(void *p) {
   sar_hton = (handlerton *)p;
   sar_hton->state = SHOW_OPTION_YES;
   sar_hton->create = sar_create_handler;
-  sar_hton->flags =
-      HTON_TEMPORARY_NOT_SUPPORTED |
-      HTON_SUPPORTS_EXTENDED_KEYS;  // TODO HTON_CAN_RECREATE?
-                                    //  HTON_SUPPORTS_TABLE_ENCRYPTION?
+  sar_hton->flags = HTON_TEMPORARY_NOT_SUPPORTED;
+  // HTON_SUPPORTS_EXTENDED_KEYS?
+  // HTON_CAN_RECREATE?
+  // HTON_SUPPORTS_TABLE_ENCRYPTION?
 
   sar_hton->is_supported_system_table =
       sar_is_supported_system_table;  // 具体作用并不是非常清楚，保留吧
@@ -247,100 +248,87 @@ static ups_status_t create_mysql_table(const char *table_name, TABLE *table) {
 
   ups_db_t *db;
   ups_status_t st;
+  uint16 new_dbname;
   int num_indices = table->s->keys;
-  bool has_primary_index = false;
+  bool pk_is_hidden = table->s->is_missing_primary_key();
   std::shared_ptr<Catalogue::Table> new_table(new Catalogue::Table(table_name));
   ups_env_t *env = Catalogue::env_manager->get_env();
 
-  DBUG_ASSERT(num_indices > 0);
-  std::vector<uint16_t> dbnames(num_indices);
-  for (int i = 0; i < num_indices; ++i) {
-    dbnames[i] = Catalogue::env_manager->get_new_db_name();
-    if (unlikely(dbnames[i] == 0)) {
-      sql_print_error("no more ups database could be use.");
-      return UPS_LIMITS_REACHED;
+  // create primary key db
+  uint32 pk_type, pk_length;
+  if (pk_is_hidden) {
+    pk_type = UPS_TYPE_UINT64;
+    pk_length = sizeof(uint64);
+  } else {
+    KEY *pk_info = table->key_info + table->s->primary_key;
+    DBUG_ASSERT(0 == ::strcmp("PRIMARY", pk_info->name));
+    st = mysql_key_info_to_internal_key_info(pk_info, pk_type, pk_length);
+    if (unlikely(st != 0)) {
+      return st;
     }
   }
+  // UPS_PARAM_RECORD_SIZE
+  // 字段是可以不设置的，我猜测如果设置的话性能会有一定的优化（存储的时候不需要长度前缀，且可以定长切片）
+  // 简化处理，就不设置了
+  ups_parameter_t params_primary[] = {{UPS_PARAM_KEY_TYPE, pk_type},
+                                      {UPS_PARAM_KEY_SIZE, pk_length},
+                                      {UPS_PARAM_RECORD_TYPE, UPS_TYPE_BINARY},
+                                      {0, 0}};
+  new_dbname = Catalogue::env_manager->get_new_db_name();
+  if (unlikely(new_dbname == 0)) {
+    sql_print_error("no more ups database could be use.");
+    return UPS_LIMITS_REACHED;
+  }
+  st = ups_env_create_db(env, &db, new_dbname, 0, params_primary);
+  if (unlikely(st != 0)) {
+    log_error("ups_env_create_db", st);
+    return st;
+  }
+  new_table->indices.push_back(
+      Catalogue::Index(db, pk_is_hidden ? MAX_KEY : table->s->primary_key,
+                       pk_is_hidden ? Catalogue::KEY_TYPE_HIDDEN_PRIMARY
+                                    : Catalogue::KEY_TYPE_PRIMARY,
+                       pk_type));
 
-  // key info for the primary key
-  std::pair<uint32_t, uint32_t> primary_type_info;
-
-  // 每轮一个index，创建出对应的db
+  // create secondary index
   KEY *key_info = table->key_info;
   for (int i = 0; i < num_indices; i++, key_info++) {
+    if (0 == ::strcmp("PRIMARY", key_info->name)) continue;
+
+    // get key type and key size
     uint32_t key_type;
     uint32_t key_size;
     st = mysql_key_info_to_internal_key_info(key_info, key_type, key_size);
     if (unlikely(st != 0)) {
-      return -1;
+      return st;
     }
-    DBUG_ASSERT(key_type != UPS_TYPE_CUSTOM);
 
     bool enable_duplicates = true;
-    bool is_primary_key = false;
-
-    if (0 == ::strcmp("PRIMARY", key_info->name)) is_primary_key = true;
-    // 我们不支持无主键
-    if (num_indices == 1) DBUG_ASSERT(is_primary_key);
-
-    if (is_primary_key) {
-      has_primary_index = true;
-      primary_type_info.first = key_type;
-      primary_type_info.second = key_size;
-      enable_duplicates = false;
-    }
     if (key_info->flags & HA_NOSAME) enable_duplicates = false;
 
     uint32_t flags = 0;
     if (enable_duplicates) flags |= UPS_ENABLE_DUPLICATE_KEYS;
 
-    int p = 1;
     ups_parameter_t params[] = {{UPS_PARAM_KEY_TYPE, key_type},
-                                {0, 0},
-                                {0, 0},
-                                {0, 0},
-                                {0, 0},
-                                {0, 0},
-                                {0, 0},
+                                {UPS_PARAM_KEY_SIZE, key_size},
+                                // record of secondary index is primary key
+                                {UPS_PARAM_RECORD_TYPE, pk_type},
+                                {UPS_PARAM_RECORD_SIZE, pk_length},
                                 {0, 0}};
-
-    // set a key size if the key is CHAR(n) or BINARY(n)
-    if (key_size != 0 && key_type == UPS_TYPE_BINARY) {
-      params[p].name = UPS_PARAM_KEY_SIZE;
-      params[p].value = key_size;
-      p++;
+    new_dbname = Catalogue::env_manager->get_new_db_name();
+    if (unlikely(new_dbname == 0)) {
+      sql_print_error("no more ups database could be use.");
+      return UPS_LIMITS_REACHED;
     }
-
-    // for secondary indices: set the record type to the same type as
-    // the primary key
-    if (!is_primary_key) {
-      params[p].name = UPS_PARAM_RECORD_TYPE;
-      params[p].value = primary_type_info.first;
-      p++;
-      if (primary_type_info.second != 0) {
-        params[p].name = UPS_PARAM_RECORD_SIZE;
-        params[p].value = primary_type_info.second;
-        p++;
-      }
-    }
-
-    // primary key: if a record has fixed length then set a parameter
-    if (is_primary_key && row_is_fixed_length(table)) {
-      params[p].name = UPS_PARAM_RECORD_SIZE;
-      params[p].value = table->s->stored_rec_length;
-      p++;
-    }
-
-    st = ups_env_create_db(env, &db, dbnames[i], flags, params);
+    st = ups_env_create_db(env, &db, new_dbname, flags, params);
     if (unlikely(st != 0)) {
       log_error("ups_env_create_db", st);
       return st;
     }
-
-    new_table->indices.emplace_back(db, i, is_primary_key, key_type);
+    new_table->indices.push_back(
+        Catalogue::Index(db, i, Catalogue::KEY_TYPE_GENERAL, key_type));
   }
 
-  DBUG_ASSERT(has_primary_index == true);
   // 把new_table放到env_manager里面
   Catalogue::env_manager->add_table(table_name, new_table);
   return 0;
@@ -464,20 +452,14 @@ int ha_sar::create(const char *name, TABLE *table, HA_CREATE_INFO *,
 */
 int ha_sar::open(const char *name, int, uint, const dd::Table *) {
   DBUG_ENTER("ha_sar::open");
-
-  // TODO
-  // 应该把其他函数修改地更通用(用table_share->primary_key代替默认认为的0)，
-  //  而不是在这assert
-  DBUG_ASSERT(table_share->primary_key == 0);
-
   // 使用表锁的必要步骤
   share = get_share();
   if (unlikely(!share)) DBUG_RETURN(1);
   thr_lock_data_init(&share->lock, &lock_data, nullptr);
 
-  ups_set_committed_flush_threshold(30);
+  // ups_set_committed_flush_threshold(30);
   record_arena.resize(table->s->rec_buff_length);
-
+  DBUG_ASSERT(Catalogue::env_manager != nullptr);
   current_table = Catalogue::env_manager->get_table_from_name(name);
 
   if (!current_table) {
@@ -486,7 +468,14 @@ int ha_sar::open(const char *name, int, uint, const dd::Table *) {
   }
 
   // 这里把ref_length设置为主键的最大长度，我感觉还是可以不用管ref_length
-  ref_length = table->key_info->key_length;
+  if (table->s->is_missing_primary_key()) {
+    ref_length = sizeof(uint64);
+  } else {
+    uint32 k,s;
+    mysql_key_info_to_internal_key_info(table->key_info + table->s->primary_key,k,s);
+    ref_length = s;
+  }
+  // ref_length = table->key_info->key_length;
 
   DBUG_RETURN(0);
 }
@@ -530,12 +519,13 @@ int ha_sar::close() {
  * @param record_arena record buffer
  * @return 0成功，否则失败
  */
-static inline int insert_primary_key(Catalogue::Index &catidx, TABLE *table,
+static inline int insert_primary_key(Catalogue::Table &cattbl,
+                                     Catalogue::Index &catidx, TABLE *table,
                                      uint8_t *buf, ups_txn_t *txn,
                                      ByteVector &key_arena,
                                      ByteVector &record_arena) {
   ups_key_t key = key_from_row(buf, get_key_info(table, catidx.key_index),
-                               table, key_arena);
+                               table, cattbl, key_arena);
   ups_record_t record = record_from_row(table, buf, record_arena);
 
   ups_status_t st = ups_db_insert(catidx.db, txn, &key, &record, 0);
@@ -557,18 +547,18 @@ static inline int insert_primary_key(Catalogue::Index &catidx, TABLE *table,
  * @param record_arena record buffer
  * @return 0成功，否则失败
  */
-static inline int insert_secondary_key(TABLE *table, Catalogue::Index &catidx,
-                                       uint8_t *buf, ups_txn_t *txn,
-                                       ByteVector &key_arena,
+static inline int insert_secondary_key(Catalogue::Table &cattbl, TABLE *table,
+                                       Catalogue::Index &catidx, uint8_t *buf,
+                                       ups_txn_t *txn, ByteVector &key_arena,
                                        ByteVector &record_arena) {
   // The record of the secondary index is the primary key of the row
   ups_key_t primary_key =
-      key_from_row(buf, get_key_info(table, 0), table, record_arena);
+      key_from_row(buf, get_key_info(table, 0), table, cattbl, record_arena);
   ups_record_t record = ups_make_record(primary_key.data, primary_key.size);
 
   // The actual key is the column's value
   ups_key_t key = key_from_row(buf, get_key_info(table, catidx.key_index),
-                               table, key_arena);
+                               table, cattbl, key_arena);
 
   uint32_t flags = 0;
   if (key_enable_duplicates(get_key_info(table, catidx.key_index)))
@@ -599,15 +589,15 @@ static inline int insert_multiple_indices(Catalogue::Table *cattbl,
                                           ByteVector &record_arena) {
   for (auto &idx : cattbl->indices) {
     // is this the primary index?
-    if (idx.is_primary_index) {
-      int rc =
-          insert_primary_key(idx, table, buf, txn, key_arena, record_arena);
+    if (idx.index_key_type != Catalogue::KEY_TYPE_GENERAL) {
+      int rc = insert_primary_key(*cattbl, idx, table, buf, txn, key_arena,
+                                  record_arena);
       if (unlikely(rc)) return rc;
     }
     // is this a secondary index?
     else {
-      int rc =
-          insert_secondary_key(table, idx, buf, txn, key_arena, record_arena);
+      int rc = insert_secondary_key(*cattbl, table, idx, buf, txn, key_arena,
+                                    record_arena);
       if (unlikely(rc)) return rc;
     }
   }
@@ -647,11 +637,12 @@ static inline ups_cursor_t *locate_secondary_key(ups_db_t *db, ups_txn_t *txn,
 }
 
 // 删除secondary_index中的一条记录，其中primary_key是记录的值
-static inline int delete_from_secondary(TABLE *table, ups_db_t *db,
-                                        KEY *key_info, const uint8_t *buf,
-                                        ups_txn_t *txn, ups_key_t *primary_key,
+static inline int delete_from_secondary(Catalogue::Table &cattbl, TABLE *table,
+                                        ups_db_t *db, KEY *key_info,
+                                        const uint8_t *buf, ups_txn_t *txn,
+                                        ups_key_t *primary_key,
                                         ByteVector &key_arena) {
-  ups_key_t key = key_from_row(buf, key_info, table, key_arena);
+  ups_key_t key = key_from_row(buf, key_info, table, cattbl, key_arena);
   ups_record_t primary_record =
       ups_make_record(primary_key->data, primary_key->size);
   CursorProxy cp(locate_secondary_key(db, txn, &key, &primary_record));
@@ -677,8 +668,9 @@ static int delete_multiple_indices(TABLE *table, Catalogue::Table *cattbl,
 
   // 提取出 primary key
   ups_key_t primary_key;
-  ups_key_t key = key_from_row(
-      buf, get_key_info(table, cattbl->indices[0].key_index), table, key_arena);
+  ups_key_t key =
+      key_from_row(buf, get_key_info(table, cattbl->indices[0].key_index),
+                   table, *cattbl, key_arena);
   primary_key = key;
 
   for (auto &idx : cattbl->indices) {
@@ -688,7 +680,7 @@ static int delete_multiple_indices(TABLE *table, Catalogue::Table *cattbl,
     (void)field;
 
     // is this the primary index?
-    if (idx.is_primary_index) {
+    if (idx.index_key_type != Catalogue::KEY_TYPE_GENERAL) {
       st = ups_db_erase(idx.db, tx, &primary_key, 0);
       if (unlikely(st != 0)) {
         log_error("ups_db_erase", st);
@@ -697,7 +689,7 @@ static int delete_multiple_indices(TABLE *table, Catalogue::Table *cattbl,
     }
     // is this a secondary index?
     else {
-      int rc = delete_from_secondary(table, idx.db,
+      int rc = delete_from_secondary(*cattbl, table, idx.db,
                                      get_key_info(table, idx.key_index), buf,
                                      tx, &primary_key, key_arena);
       if (unlikely(rc != 0)) return rc;
@@ -737,112 +729,6 @@ static inline int ups_status_to_error(TABLE *table, const char *msg,
   return HA_ERR_GENERIC;
 }
 
-//抽取出一个KEY，缓存在key_arena中，同时返回ups_key_t,keybuf中保存的必须是要抽取的key
-// static ups_key_t extract_key(const uint8_t *keybuf, KEY *key_info,
-//                              ByteVector &key_arena) {
-//   ups_key_t key = ups_make_key(nullptr, 0);
-//   KEY_PART_INFO *key_part = key_info->key_part;
-//   uint32_t key_parts = key_info->user_defined_key_parts;
-//
-//   // if this is not a multi-part key AND it has fixed length then we can
-//   // simply use the existing |keybuf| pointer for the lookup
-//   if (key_parts == 1 && length_bytes_len(key_part->type) == 0) {
-//     key.data = key_part->null_bit ? (void *)(keybuf + 1) : (void *)keybuf;
-//     key.size = key_part->length;
-//   }
-//   // otherwise we have to unpack the row and transform it into the
-//   // correct format
-//   else {
-//     const uint8_t *p = keybuf;
-//     key_arena.clear();
-//
-//     for (uint32_t i = 0; i < key_parts; i++, key_part++) {
-//       // skip null byte, if it exists
-//       // TODO 这个我不是完全了解，什么时候打个断点看看
-//       if (key_part->null_bit) p++;
-//
-//       uint32_t length;
-//       switch (length_bytes_len(key_part->type)) {
-//         case 0:
-//           length = key_part->length;
-//           break;
-//         case 1:
-//           length = *(uint16_t *)p;
-//           // append the length if it's a multi-part key
-//           if (key_parts > 1) {
-//             key_arena.push_back((uint8_t)length);
-//             key.size += 1;
-//           }
-//           p += 2;
-//           break;
-//         case 2:
-//           length = *(uint16_t *)p;
-//           // append the length if it's a multi-part key
-//           if (key_parts > 1) {
-//             key_arena.insert(key_arena.end(), p, p + 2);
-//             key.size += 2;
-//           }
-//           p += 2;
-//           break;
-//       }
-//
-//       // append the key data
-//       key_arena.insert(key_arena.end(), p, p + length);
-//       key.size += length;
-//       p += key_part->length;
-//     }
-//
-//     key.data = key_arena.data();
-//   }
-//   return key;
-// }
-//
-//// 这个函数和前面几乎唯一的区别就是key_info->user_defined_key_parts换成了
-//// table->reginfo.qep_tab->ref().key_parts
-//// 这个里面的QEP_TAB完全不知道是干什么用的
-// static ups_key_t extract_first_keys(const uint8_t *keybuf, TABLE *table,
-//                                     KEY *key_info, ByteVector &key_arena) {
-//   ups_key_t key = ups_make_key(nullptr, 0);
-//   KEY_PART_INFO *key_part = key_info->key_part;
-//   DBUG_ASSERT(key_info->user_defined_key_parts > 1);
-//
-//   const uint8_t *p = keybuf;
-//   key_arena.clear();
-//
-//   for (uint32_t i = 0; i < table->reginfo.qep_tab->ref().key_parts;
-//        i++, key_part++) {
-//     // skip null byte, if it exists
-//     if (key_part->null_bit) p++;
-//
-//     uint32_t length;
-//     switch (length_bytes_len(key_part->type)) {
-//       case 0:
-//         length = key_part->length;
-//         break;
-//       case 1:
-//         length = *(uint16_t *)p;
-//         // always append the length for multi-part keys
-//         key_arena.push_back((uint8_t)length);
-//         p += 2;
-//         break;
-//       case 2:
-//         length = *(uint16_t *)p;
-//         // always append the length for multi-part keys
-//         key_arena.insert(key_arena.end(), p, p + 2);
-//         p += 2;
-//         break;
-//     }
-//
-//     // append the key data
-//     key_arena.insert(key_arena.end(), p, p + length);
-//     p += length;
-//   }
-//
-//   key.size = key_arena.size();
-//   key.data = key_arena.data();
-//   return key;
-// }
-
 /**
   @brief
   write_row() inserts a row. No extra() hint is given currently if a bulk load
@@ -867,10 +753,21 @@ int ha_sar::write_row(uchar *buf) {
   // duplicate_error_index = (uint32_t)-1;
   DBUG_ASSERT(!current_table->indices.empty());
 
+  /*
+  Note: "buf == table->record[0]" is copied from innodb. I am not aware of
+  any use cases where this condition is not true.
+*/
+  if (table->next_number_field && buf == table->record[0]) {
+    int err;
+    if ((err = update_auto_increment())) {
+      DBUG_RETURN(err);
+    }
+  }
+
   // only one index? do not need transaction
   if (current_table->indices.size() == 1) {
-    int rc = insert_primary_key(current_table->indices[0], table, buf, nullptr,
-                                key_arena, record_arena);
+    int rc = insert_primary_key(*current_table, current_table->indices[0],
+                                table, buf, nullptr, key_arena, record_arena);
     // if (unlikely(rc == HA_ERR_FOUND_DUPP_KEY)) duplicate_error_index = 0;
     DBUG_RETURN(rc);
   }
@@ -912,10 +809,10 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
     ups_key_t oldkey =
         key_from_row((uchar *)old_buf,
                      get_key_info(table, current_table->indices[0].key_index),
-                     table, old_pk);
+                     table, *current_table, old_pk);
     ups_key_t newkey = key_from_row(
         new_buf, get_key_info(table, current_table->indices[0].key_index),
-        table, key_arena);
+        table, *current_table, key_arena);
     bool equal = are_keys_equal(&oldkey, &newkey);
 
     // if both keys are equal: simply overwrite the record of the
@@ -929,14 +826,6 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
       }
       DBUG_RETURN(0);
     }
-
-    // otherwise delete the old row, insert the new one. Inserting can fail if
-    // the key is not unique, therefore both operations are wrapped
-    // in a single transaction.
-    // TxnProxy txnp(Catalogue::env_manager->env);
-    //    if (unlikely(!txnp.txn)) {
-    //      DBUG_RETURN(1);
-    //    }
 
     ups_db_t *db = current_table->indices[0].db;
     st = ups_db_erase(db, tx, &oldkey, 0);
@@ -961,25 +850,18 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
   for (auto &idx : current_table->indices) {
     ups_key_t oldkey =
         key_from_row((uchar *)old_buf, get_key_info(table, idx.key_index),
-                     table, old_second_k);
+                     table, *current_table, old_second_k);
     ups_key_t newkey = key_from_row(new_buf, get_key_info(table, idx.key_index),
-                                    table, new_second_k);
+                                    table, *current_table, new_second_k);
     changed[i++] = !are_keys_equal(&oldkey, &newkey);
   }
 
-  // Again wrap all of this in a single transaction, in case we fail
-  // to insert the new row.
-  //  TxnProxy txnp(Catalogue::env_manager->env);
-  //  if (unlikely(!txnp.txn)) {
-  //    DBUG_RETURN(1);
-  //  }
-
   ups_key_t new_primary_key = key_from_row(
       new_buf, get_key_info(table, current_table->indices[0].key_index), table,
-      key_arena);
+      *current_table, key_arena);
   ups_key_t old_primary_key = key_from_row(
       old_buf, get_key_info(table, current_table->indices[0].key_index), table,
-      old_pk);
+      *current_table, old_pk);
 
   // primary key
   if (changed[0]) {
@@ -1018,11 +900,11 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
     ups_key_t newkey =
         key_from_row((uchar *)new_buf,
                      get_key_info(table, current_table->indices[i].key_index),
-                     table, new_second_k);
+                     table, *current_table, new_second_k);
     if (changed[i]) {
       // secondary index有修改，删除原来的记录并插入新记录
       int rc = delete_from_secondary(
-          table, current_table->indices[i].db,
+          *current_table, table, current_table->indices[i].db,
           get_key_info(table, current_table->indices[i].key_index), old_buf, tx,
           &old_primary_key, old_second_k);
       if (unlikely(rc != 0)) DBUG_RETURN(rc);
@@ -1042,7 +924,7 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
       ups_key_t oldkey =
           key_from_row((uchar *)old_buf,
                        get_key_info(table, current_table->indices[i].key_index),
-                       table, old_second_k);
+                       table, *current_table, old_second_k);
       CursorProxy cp(locate_secondary_key(current_table->indices[i].db, tx,
                                           &oldkey, &old_primary_key_record));
       DBUG_ASSERT(cp.cursor != nullptr);
@@ -1092,7 +974,7 @@ int ha_sar::delete_row(const uchar *buf) {
   if (current_table->indices.size() == 1) {
     ups_key_t key = key_from_row(
         buf, get_key_info(table, current_table->indices[0].key_index), table,
-        key_arena);
+        *current_table, key_arena);
     st = ups_db_erase(current_table->indices[0].db, nullptr, &key, 0);
     if (unlikely(st != 0)) {
       log_error("ups_cursor_erase", st);
@@ -1148,28 +1030,30 @@ int ha_sar::index_end() {
   DBUG_RETURN(0);
 }
 
-static int convert_mysql_find_arg_to_internal(enum ha_rkey_function mysql_find_flag, uint32& internal_flag, uint& internal_key_fill_val) {
+static int convert_mysql_find_arg_to_internal(
+    enum ha_rkey_function mysql_find_flag, uint32 &internal_flag,
+    uint &internal_key_fill_val) {
   internal_key_fill_val = 0;
   switch (mysql_find_flag) {
     case HA_READ_KEY_EXACT:
       /* this does not require the index to be UNIQUE */
     case HA_READ_KEY_OR_NEXT:
       internal_flag = UPS_FIND_GEQ_MATCH;
-      break ;
+      break;
     case HA_READ_AFTER_KEY:
       internal_flag = UPS_FIND_GT_MATCH;
-      break ;
+      break;
     case HA_READ_BEFORE_KEY:
       internal_flag = UPS_FIND_LT_MATCH;
-      break ;
+      break;
     case HA_READ_KEY_OR_PREV:
       internal_flag = UPS_FIND_LEQ_MATCH;
-      break ;
+      break;
     case HA_READ_PREFIX_LAST:
     case HA_READ_PREFIX_LAST_OR_PREV:
       internal_flag = UPS_FIND_LEQ_MATCH;
       internal_key_fill_val = 0xff;
-      break ;
+      break;
     case HA_READ_MBR_CONTAIN:
     case HA_READ_MBR_INTERSECT:
     case HA_READ_MBR_WITHIN:
@@ -1183,14 +1067,18 @@ static int convert_mysql_find_arg_to_internal(enum ha_rkey_function mysql_find_f
 }
 
 int ha_sar::index_read_map(uchar *buf, const uchar *key,
-                   key_part_map keypart_map,
-                   enum ha_rkey_function find_flag) {
+                           key_part_map keypart_map,
+                           enum ha_rkey_function find_flag) {
   DBUG_ENTER("ha_sar::index_read");
   DBUG_ASSERT(active_index != MAX_KEY);
   DBUG_ASSERT(current_table != nullptr);
   DBUG_ASSERT(current_cursor != nullptr);
 
   bool read_primary_index = (active_index == 0);
+  if (read_primary_index) {
+    DBUG_ASSERT(current_table->indices[active_index].index_key_type !=
+                Catalogue::KEY_TYPE_GENERAL);
+  }
 
   // when reading from the primary index: directly fetch record into |buf|
   // if the row has fixed length
@@ -1208,11 +1096,13 @@ int ha_sar::index_read_map(uchar *buf, const uchar *key,
     uint32 internal_find_flag;
     uint fill_val;
     uint32 exact_key_size;
-    if (convert_mysql_find_arg_to_internal(find_flag, internal_find_flag, fill_val) != 0) {
+    if (convert_mysql_find_arg_to_internal(find_flag, internal_find_flag,
+                                           fill_val) != 0) {
       return HA_ERR_UNSUPPORTED;
     }
-    ups_key_t key_ups = key_from_key_buf(
-        key, keypart_map, &table->key_info[active_index], table, key_arena, fill_val, exact_key_size);
+    ups_key_t key_ups =
+        key_from_key_buf(key, keypart_map, &table->key_info[active_index],
+                         table, key_arena, fill_val, exact_key_size);
 
     // 备份这个 key 的数据，用于后面精确对比
     if (find_flag == HA_READ_KEY_EXACT) {
@@ -1487,9 +1377,6 @@ void ha_sar::position(const uchar *buf) {
 
   // Store the PRIMARY key as the reference in |ref|
   KEY *key_info = table->key_info;
-  DBUG_ASSERT(
-      ref_length ==
-      key_info->key_length);  // table->key_info[0]，指向的是primary_key的info
   key_copy(ref, (uchar *)buf, key_info, ref_length);
 
   DBUG_VOID_RETURN;

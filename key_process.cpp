@@ -4,6 +4,7 @@
 
 #include "key_process.h"
 
+
 static uint32_t key_sort_length(KEY *key_info) {
   uint32_t sz = 0;
   for (uint i = 0; i < key_info->user_defined_key_parts; i++) {
@@ -93,7 +94,15 @@ static uint32_t convert_to_sort_key(uchar *to, const uchar *buf,
 }
 
 ups_key_t key_from_row(const uchar *row_buf, KEY *mysql_key_info,
-                       TABLE *mysql_table, ByteVector &arena) {
+                       TABLE *mysql_table,  Catalogue::Table& cattbl, ByteVector &arena) {
+  if (mysql_key_info == nullptr) {
+    // this is a hidden key
+    DBUG_ASSERT(mysql_table->s->is_missing_primary_key());
+    arena.resize(8);
+    *((uint64*)arena.data()) = cattbl.hidden_index_value++;
+    return ups_make_key(arena.data(), (uint16_t)arena.size());
+  }
+
   auto internal_key_size = key_sort_length(mysql_key_info);
   arena.resize(internal_key_size, 0);
 
@@ -104,8 +113,7 @@ ups_key_t key_from_row(const uchar *row_buf, KEY *mysql_key_info,
                                   mysql_table, false, nullptr);
   }
 
-  ups_key_t key = ups_make_key(arena.data(), (uint16_t)arena.size());
-  return key;
+  return ups_make_key(arena.data(), (uint16_t)arena.size());
 }
 
 ups_key_t key_from_key_buf(const uchar *mysql_key_buf, key_part_map mysql_key_part_map,

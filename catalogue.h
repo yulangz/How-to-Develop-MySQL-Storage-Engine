@@ -22,13 +22,19 @@
 
 namespace Catalogue {
 
+enum key_type {
+  KEY_TYPE_PRIMARY = 0,
+  KEY_TYPE_HIDDEN_PRIMARY = 1,
+  KEY_TYPE_GENERAL = 2
+};
+
 // 保持Index信息，一个Index会对应一个upsdb
 struct Index {
-  explicit Index(ups_db_t *db_, int key_index_, bool is_primary_index_ = false,
+  explicit Index(ups_db_t *db_, int key_index_, enum key_type index_key_type_ = KEY_TYPE_GENERAL,
                  uint32_t key_type_ = 0)
       : db(db_),
         key_index(key_index_),
-        is_primary_index(is_primary_index_),
+        index_key_type(index_key_type_),
         key_type(key_type_) {}
 
   // 不能这样搞，每一次连接的mysql Table对象会变，key_info地址也会变
@@ -39,8 +45,8 @@ struct Index {
   ups_db_t *db;
   // 这是Table里面的第几个Key
   int key_index;
-  // 是否是主键
-  bool is_primary_index;
+  // 键的类型
+  uint8 index_key_type;
   // upscaledb key type (UPS_TYPE_UINT32 etc)
   uint32_t key_type;
 };
@@ -54,6 +60,9 @@ struct Table {
 
   // 一个Mysql Table有多个Index，每个Index对应一个upsDB的db
   std::vector<Index> indices;
+
+  // next value for hidden key
+  std::atomic<uint64> hidden_index_value{0};
 };
 
 class EnvManager;
