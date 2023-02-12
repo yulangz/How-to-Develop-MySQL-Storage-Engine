@@ -85,13 +85,18 @@ class ha_sar : public handler {
   ulonglong table_flags() const override {
     return  // HA_NO_TRANSACTIONS |      //
             // HA_NO_AUTO_INCREMENT |  //
-        // HA_MULTI_VALUED_KEY_SUPPORT
-        // key support?
-        HA_TABLE_SCAN_ON_INDEX | HA_FAST_KEY_READ |
         // HA_REQUIRE_PRIMARY_KEY |
-        HA_PRIMARY_KEY_IN_READ_INDEX | HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
-        HA_PRIMARY_KEY_REQUIRED_FOR_DELETE | HA_HAS_OWN_BINLOGGING |
-        HA_BINLOG_FLAGS | HA_NO_READ_LOCAL_LOCK | HA_GENERATED_COLUMNS;
+        HA_STATS_RECORDS_IS_EXACT |
+        HA_MULTI_VALUED_KEY_SUPPORT |
+        HA_PRIMARY_KEY_IN_READ_INDEX |
+        HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
+        HA_NULL_IN_KEY |
+        HA_PRIMARY_KEY_REQUIRED_FOR_DELETE |
+        HA_TABLE_SCAN_ON_INDEX |
+        HA_HAS_OWN_BINLOGGING |
+        HA_BINLOG_FLAGS | // 这个还要以后研究研究
+        HA_NO_READ_LOCAL_LOCK |
+        HA_GENERATED_COLUMNS;
   }
 
   /** @brief
@@ -150,17 +155,10 @@ class ha_sar : public handler {
   uint max_supported_key_length() const override {
     return std::numeric_limits<uint16_t>::max();
   }
-
-  //  TODO 更精确的实现
-  //  /** @brief
-  //    Called in test_quick_select to determine if indexes should be used.
-  //  */
-  //  virtual double scan_time() { return (double)(stats.records) / 20.0 + 10; }
-  //
-  //  virtual double read_time(uint, uint, ha_rows rows) {
-  //    return (double)rows / 20.0 + 1;
-  //  }
-
+  Cost_estimate table_scan_cost() override;
+  Cost_estimate index_scan_cost(uint index, double ranges,
+                                double rows) override;
+  Cost_estimate read_cost(uint index, double ranges, double rows) override;
   int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info,
              dd::Table *table_def) override;  ///< required
   int open(const char *name, int mode, uint test_if_locked,
@@ -198,6 +196,8 @@ class ha_sar : public handler {
   THR_LOCK_DATA **store_lock(
       THD *thd, THR_LOCK_DATA **to,
       enum thr_lock_type lock_type) override;  ///< required
-  int analyze(THD *, HA_CHECK_OPT *) override { return HA_ADMIN_OK; }
+  int analyze(THD *, HA_CHECK_OPT *) override;
+
   ups_txn_t *get_or_create_tx(THD *thd);
+  int table_primary_key() {return table->s->primary_key == MAX_KEY ? 0 : table->s->primary_key; }
 };

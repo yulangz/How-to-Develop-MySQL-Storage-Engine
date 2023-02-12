@@ -42,6 +42,8 @@
   for building a pluggable storage engine.
 */
 
+#include <cstdlib>
+#include <ups/upscaledb_uqi.h>
 #include "storage/sar/ha_sar.h"
 
 #include "my_dbug.h"
@@ -92,6 +94,8 @@ ups_txn_t *ha_sar::get_or_create_tx(THD *const thd) {
     thd_set_ha_data(thd, sar_hton, tx);
     trx_id = Catalogue::env_manager->next_trx();
     is_registered = false;
+    // sql_print_information("create trx %p", tx);
+    //sql_print_error("create trx %p", tx);
   }
   return tx;
 }
@@ -137,6 +141,8 @@ static int sar_commit(handlerton *,    /*!< in/out: InnoDB handlerton */
     if (st != UPS_SUCCESS) {
       log_error("ups_txn_commit", st);
     }
+    //sql_print_information("commit trx %p", tx);
+    //sql_print_error("commit trx %p", tx);
   }
   DBUG_RETURN(st == UPS_SUCCESS ? 0 : 1);
 }
@@ -161,6 +167,8 @@ static int sar_rollback(handlerton *,      /*!< in/out: InnoDB handlerton */
     if (st != UPS_SUCCESS) {
       log_error("ups_txn_abort", st);
     }
+    //sql_print_information("rollback trx %p", tx);
+    //sql_print_error("rollback trx %p", tx);
   } else {
     sql_print_error("savepoint not supported");
     st = UPS_INTERNAL_ERROR;
@@ -183,6 +191,7 @@ static int sar_init_func(void *p) {
   //  flag |= UPS_IN_MEMORY;
   //  flag |= UPS_DISABLE_MMAP;
   // DBUG_ASSERT(params[7].name == 0 && params[7].value == 0);
+  // params[0] = {UPS_PARAM_CACHESIZE, 0}; // todo set cache size，0 is for test
 
 #ifdef REMOTE
   st = ups_env_open(&env, UPS_ENV_NAME, flag, params);
@@ -204,9 +213,8 @@ static int sar_init_func(void *p) {
   auto max_databases = (uint16_t)params[0].value;
 
   Catalogue::env_manager = new Catalogue::EnvManager(env, max_databases);
-
-  // TODO 从system table中读出已有表端信息，并打开这些表
-
+  ups_set_committed_flush_threshold(30); // 这个设置的是经过多少个事务会有一次强制刷新磁盘
+  
   sar_hton = (handlerton *)p;
   sar_hton->state = SHOW_OPTION_YES;
   sar_hton->create = sar_create_handler;
@@ -456,8 +464,6 @@ int ha_sar::open(const char *name, int, uint, const dd::Table *) {
   share = get_share();
   if (unlikely(!share)) DBUG_RETURN(1);
   thr_lock_data_init(&share->lock, &lock_data, nullptr);
-
-  // ups_set_committed_flush_threshold(30);
   record_arena.resize(table->s->rec_buff_length);
   DBUG_ASSERT(Catalogue::env_manager != nullptr);
   current_table = Catalogue::env_manager->get_table_from_name(name);
@@ -748,8 +754,6 @@ int ha_sar::write_row(uchar *buf) {
   // table->s->reclength是一行（一个record）的最大长度，也就是说对于varchar等
   // 变长类型，会是其最长长度（而不是实际长度），直接用会有空间浪费，所以才需要自行提取
   DBUG_ENTER("ha_sar::write_row");
-
-  ups_status_t st = UPS_SUCCESS;
   // duplicate_error_index = (uint32_t)-1;
   DBUG_ASSERT(!current_table->indices.empty());
 
@@ -775,8 +779,8 @@ int ha_sar::write_row(uchar *buf) {
   int rc = insert_multiple_indices(current_table.get(), table, buf, current_tx,
                                    key_arena, record_arena);
   if (unlikely(rc)) DBUG_RETURN(rc);
-
-  DBUG_RETURN(st == 0 ? 0 : 1);
+  //++current_table->records_num;
+  DBUG_RETURN(0);
 }
 
 /**
@@ -987,7 +991,9 @@ int ha_sar::delete_row(const uchar *buf) {
   // each index
   int rc = delete_multiple_indices(table, current_table.get(), buf, key_arena,
                                    current_tx);
-  DBUG_RETURN(rc);
+  if (unlikely(rc)) DBUG_RETURN(rc);
+  //--current_table->records_num;
+  DBUG_RETURN(0);
 }
 
 // 初始化一个index cursor
@@ -1069,11 +1075,11 @@ static int convert_mysql_find_arg_to_internal(
 int ha_sar::index_read_map(uchar *buf, const uchar *key,
                            key_part_map keypart_map,
                            enum ha_rkey_function find_flag) {
-  DBUG_ENTER("ha_sar::index_read");
+  DBUG_ENTER("ha_sar::index_read_map");
   DBUG_ASSERT(active_index != MAX_KEY);
   DBUG_ASSERT(current_table != nullptr);
   DBUG_ASSERT(current_cursor != nullptr);
-
+  // end_range
   bool read_primary_index = (active_index == 0);
   if (read_primary_index) {
     DBUG_ASSERT(current_table->indices[active_index].index_key_type !=
@@ -1444,12 +1450,17 @@ int ha_sar::rnd_pos(uchar *buf, uchar *pos) {
 */
 int ha_sar::info(uint flag __attribute__((unused))) {
   DBUG_ENTER("ha_sar::info");
-
+  //stats.records = current_table->records_num;
+  ups_status_t st = UPS_SUCCESS;
+  auto tx = get_tx_from_thd(ha_thd());
+  uint64_t c;
+  st = ups_db_count(current_table->indices[0].db,tx,0,&c);
+  if (unlikely(st != UPS_SUCCESS)) {
+    log_error("ups_db_count", st);
+    DBUG_RETURN(1);
+  }
+  stats.records = c;
   /// if (flag & HA_STATUS_ERRKEY) errkey = duplicate_error_index;
-
-  // TODO stats.records = ???
-  stats.records = 2;
-
   DBUG_RETURN(0);
 }
 
@@ -1464,6 +1475,44 @@ int ha_sar::info(uint flag __attribute__((unused))) {
 int ha_sar::extra(enum ha_extra_function) {
   DBUG_ENTER("ha_sar::extra");
   DBUG_RETURN(0);
+}
+
+ha_rows ha_sar::records_in_range(uint inx, key_range *min_key, key_range *max_key) {
+  DBUG_ENTER("ha_sar::records_in_range");
+  DBUG_RETURN(handler::records_in_range(inx,min_key,max_key));
+}
+
+Cost_estimate ha_sar::table_scan_cost() {
+  double scan_pages = (double)stats.records / current_table->indices[table_primary_key()].keys_per_page() + 1;
+  const double io_cost = scan_pages * table->cost_model()->page_read_cost(1.0);
+  Cost_estimate cost; // 有利于RVO（Return Value Optimization）
+  cost.add_io(io_cost);
+  return cost;
+}
+Cost_estimate ha_sar::index_scan_cost(uint index, double ranges, double rows) {
+  // todo 等支持 Index Only Scan之后再实现，Index Only Scan 应该是指只需要通过索引就能查到结果，不需要回表
+  return handler::index_scan_cost(index, ranges, rows);
+}
+Cost_estimate ha_sar::read_cost(uint index, double ranges, double rows) {
+  double read_pages;
+  if (index == table->s->primary_key) {
+    read_pages = rows / current_table->indices[table_primary_key()].keys_per_page() + ranges;
+  } else {
+    read_pages = rows + ranges;
+  }
+  const double io_cost = read_pages * table->cost_model()->page_read_cost(1.0);
+  Cost_estimate cost;
+  cost.add_io(io_cost);
+  return cost;
+}
+
+int ha_sar::analyze(THD *, HA_CHECK_OPT *) {
+  DBUG_ENTER("ha_sar::analyze");
+  if (info(HA_STATUS_CONST | HA_STATUS_VARIABLE) != 0) {
+    DBUG_RETURN(HA_ADMIN_FAILED);
+  }
+
+  DBUG_RETURN(HA_ADMIN_OK);
 }
 
 /**
@@ -1652,24 +1701,6 @@ int ha_sar::rename_table(const char *, const char *, const dd::Table *,
                          dd::Table *) {
   DBUG_ENTER("ha_sar::rename_table ");
   DBUG_RETURN(HA_ERR_WRONG_COMMAND);
-}
-
-/**
-  @brief
-  Given a starting key and an ending key, estimate the number of rows that
-  will exist between the two keys.
-
-  @details
-  end_key may be empty, in which case determine if start_key matches any rows.
-
-  Called from opt_range.cc by check_quick_keys().
-
-  @see
-  check_quick_keys() in opt_range.cc
-*/
-ha_rows ha_sar::records_in_range(uint, key_range *, key_range *) {
-  DBUG_ENTER("ha_sar::records_in_range");
-  DBUG_RETURN(10);  // low number to force index usage
 }
 
 struct st_mysql_storage_engine sar_storage_engine = {

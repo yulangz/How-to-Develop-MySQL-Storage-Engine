@@ -66,7 +66,10 @@ static uint32_t convert_to_sort_key(uchar *to, const uchar *buf,
                       field->null_bit);
     DBUG_ASSERT(key_part_real_length != nullptr);
     *key_part_real_length =
-        field->data_length() + field->get_length_bytes() + (maybe_null ? 1 : 0);
+        field->data_length() + (maybe_null ? 1 : 0);
+    if (field->type() == MYSQL_TYPE_VARCHAR) {
+      *key_part_real_length += field->get_length_bytes();
+    }
   } else {
     field->move_field(
         const_cast<uchar *>(buf) + field_offset,

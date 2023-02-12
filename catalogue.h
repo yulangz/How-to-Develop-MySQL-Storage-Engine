@@ -49,6 +49,11 @@ struct Index {
   uint8 index_key_type;
   // upscaledb key type (UPS_TYPE_UINT32 etc)
   uint32_t key_type;
+
+  int keys_per_page() {
+    // todo 使用 ups_db_get_parameters()
+    return 40;
+  }
 };
 
 // 保存一个MySQL的Table，一个Table下有多个Index
@@ -63,6 +68,9 @@ struct Table {
 
   // next value for hidden key
   std::atomic<uint64> hidden_index_value{0};
+
+  // 表中元素总数
+  // std::atomic<uint32_t> records_num{0};
 };
 
 class EnvManager;

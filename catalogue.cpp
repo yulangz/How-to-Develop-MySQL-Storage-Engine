@@ -2,6 +2,8 @@
 // Created by yulan on 22-6-28.
 //
 #include "catalogue.h"
+#include "ups/upscaledb_uqi.h"
+#include "ups/upscaledb.h"
 
 namespace Catalogue {
 
@@ -19,7 +21,6 @@ std::shared_ptr<Table> EnvManager::get_table_from_name(const char *table_name) {
 
 ups_status_t EnvManager::free_table(const char *table_name) {
   ups_status_t st = UPS_SUCCESS;
-  std::lock_guard<std::mutex> g(lock);
 
   auto table = get_table_from_name(table_name);
   if (unlikely(table == nullptr)) {
@@ -27,6 +28,7 @@ ups_status_t EnvManager::free_table(const char *table_name) {
     return UPS_DATABASE_NOT_FOUND;
   }
 
+  std::lock_guard<std::mutex> g(lock);
   // 删除与这个table相关的全部upsdb
   for (auto &index : table->indices) {
     uint16_t dbname = ups_db_get_name(index.db);
@@ -122,6 +124,8 @@ ups_status_t EnvManager::read_all_tables() {
     std::string table_name((char*)k.data, k.size);
     std::shared_ptr<Table> new_table(new Table(table_name));
     DBUG_ASSERT(r.size % BytePerIndexRecord == 0);
+
+    // 读出所有的 Index
     size_t index_num = r.size / BytePerIndexRecord;
     for (size_t i = 0;i < index_num; i++) {
       uint16_t db_name;
@@ -146,6 +150,24 @@ ups_status_t EnvManager::read_all_tables() {
         new_table->hidden_index_value = get_next_key(db);
       }
     }
+
+    // 读出表中的统计信息
+//    uqi_result_t *uqi_result = nullptr;
+//    ups_record_t record = ups_make_record(0,0);
+//    char uqi_string_buffer[40] = "COUNT($key) FROM DATABASE ";
+//    char *db_name_p = uqi_string_buffer + sizeof("COUNT($key) FROM DATABASE ") - 1;
+//    auto db_name = ups_db_get_name(new_table->indices.back().db);
+//    sprintf(db_name_p, "%u", (uint32_t)db_name);
+//    st = uqi_select(env, uqi_string_buffer, &uqi_result);
+//    if (unlikely(st != UPS_SUCCESS || !uqi_result)) {
+//      log_error("uqi_select", st);
+//      return st;
+//    }
+//    uqi_result_get_record(uqi_result, 0, &record);
+//    new_table->records_num = *(uint32_t *)record.data;
+//    uqi_result_close(uqi_result);
+
+    // 插入 table map
     table_map[table_name] = new_table;
     st = ups_cursor_move(cursorProxy.cursor, &k, &r, UPS_CURSOR_NEXT);
   }
