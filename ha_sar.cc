@@ -92,8 +92,9 @@ ups_txn_t *ha_sar::get_or_create_tx(THD *const thd) {
       log_error("ups_txn_begin", st);
     }
     thd_set_ha_data(thd, sar_hton, tx);
-    trx_id = Catalogue::env_manager->next_trx();
+    //trx_id = Catalogue::env_manager->next_trx();
     is_registered = false;
+    table_in_use = 0;
     // sql_print_information("create trx %p", tx);
     //sql_print_error("create trx %p", tx);
   }
@@ -214,7 +215,7 @@ static int sar_init_func(void *p) {
 
   Catalogue::env_manager = new Catalogue::EnvManager(env, max_databases);
   ups_set_committed_flush_threshold(30); // 这个设置的是经过多少个事务会有一次强制刷新磁盘
-  
+
   sar_hton = (handlerton *)p;
   sar_hton->state = SHOW_OPTION_YES;
   sar_hton->create = sar_create_handler;
@@ -239,11 +240,11 @@ static int sar_uninstall_func(void *p __attribute__((unused))) {
 }
 
 // key是否存在于db中
-static inline bool key_exists(ups_db_t *db, ups_key_t *key) {
-  ups_record_t record = ups_make_record(nullptr, 0);
-  ups_status_t st = ups_db_find(db, nullptr, key, &record, 0);
-  return st == 0;
-}
+//static inline bool key_exists(ups_db_t *db, ups_key_t *key) {
+//  ups_record_t record = ups_make_record(nullptr, 0);
+//  ups_status_t st = ups_db_find(db, nullptr, key, &record, 0);
+//  return st == 0;
+//}
 
 // 删除一张Mysql表，删除upsdb中与这张表相关的全部内容，最后从env_manager内将其删除
 static ups_status_t delete_mysql_table(const char *table_name) {
@@ -771,7 +772,7 @@ int ha_sar::write_row(uchar *buf) {
   // only one index? do not need transaction
   if (current_table->indices.size() == 1) {
     int rc = insert_primary_key(*current_table, current_table->indices[0],
-                                table, buf, nullptr, key_arena, record_arena);
+                                table, buf, current_tx, key_arena, record_arena);
     // if (unlikely(rc == HA_ERR_FOUND_DUPP_KEY)) duplicate_error_index = 0;
     DBUG_RETURN(rc);
   }
@@ -979,7 +980,7 @@ int ha_sar::delete_row(const uchar *buf) {
     ups_key_t key = key_from_row(
         buf, get_key_info(table, current_table->indices[0].key_index), table,
         *current_table, key_arena);
-    st = ups_db_erase(current_table->indices[0].db, nullptr, &key, 0);
+    st = ups_db_erase(current_table->indices[0].db, current_tx, &key, 0);
     if (unlikely(st != 0)) {
       log_error("ups_cursor_erase", st);
       DBUG_RETURN(1);
@@ -1535,8 +1536,6 @@ int ha_sar::analyze(THD *, HA_CHECK_OPT *) {
 int ha_sar::external_lock(THD *thd, int lock_type) {
   DBUG_ENTER("ha_sar::external_lock");
   DBUG_PRINT("external lock", ("lock_type = %d", lock_type));
-  auto tx = get_or_create_tx(thd);
-  this->current_tx = tx;
 
   // if (lock_type != F_ULOCK) { 是下面这个宏不是上面这个！！！
   if (lock_type != F_UNLCK) {
@@ -1546,6 +1545,10 @@ int ha_sar::external_lock(THD *thd, int lock_type) {
     // 我们不支持savepoint，但还是按照这个规则来。
     // all 为 true的条件是：这个事务没有注册过，且 （非auto commit 模式 或是
     // begin语句）
+    auto tx = get_or_create_tx(ha_thd());
+    if (tx == nullptr)
+      DBUG_RETURN(1);
+    current_tx = tx;
     bool all = !is_registered &&
                (thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN));
     if (all) {
@@ -1554,11 +1557,22 @@ int ha_sar::external_lock(THD *thd, int lock_type) {
       trans_register_ha(thd, false, this->ht, &trx_id);
     }
     is_registered = true;
-    DBUG_PRINT("register",
-               ("register %llu trx to mysql with all=%d", trx_id, all));
+    table_in_use++;
+//    DBUG_PRINT("register",
+//               ("register %llu trx to mysql with all=%d", trx_id, all));
+  } else {
+    auto tx = get_tx_from_thd(ha_thd());
+    if (tx) {
+      table_in_use--;
+      if (table_in_use == 0 && !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN)) {
+        if (sar_commit(this->ht, ha_thd(), true) != 0) {
+          DBUG_RETURN(1);
+        }
+      }
+    }
   }
 
-  DBUG_RETURN(tx == nullptr ? 1 : 0);
+  DBUG_RETURN(0);
 }
 
 // 这表明我们不需要Mysql的表锁

@@ -37,8 +37,9 @@ class ha_sar : public handler {
 
   // 当前正在使用的txn
   ups_txn_t *current_tx;  // 理论上和 get_tx_from_thd(ha_thd()) 是一样的
-  ulonglong trx_id;       // 当前trx的id，似乎不是必须的
+  ulonglong trx_id = 0;       // 当前trx的id，似乎不是必须的
   bool is_registered;
+  int32_t table_in_use;
 
   // MySQL table lock，按照innodb里面的实现，这个是可以不需要的，暂时保留
   THR_LOCK_DATA lock_data;
