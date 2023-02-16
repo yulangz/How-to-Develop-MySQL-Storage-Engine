@@ -28,7 +28,7 @@ enum key_type {
   KEY_TYPE_GENERAL = 2
 };
 
-// 保持Index信息，一个Index会对应一个upsdb
+// 保存 Index 的基本信息，每个 Index 就是一个 MySQL Table Key，对应一个 upsdb 存储
 struct Index {
   explicit Index(ups_db_t *db_, int key_index_, enum key_type index_key_type_ = KEY_TYPE_GENERAL,
                  uint32_t key_type_ = 0)
@@ -37,18 +37,15 @@ struct Index {
         index_key_type(index_key_type_),
         key_type(key_type_) {}
 
-  // 不能这样搞，每一次连接的mysql Table对象会变，key_info地址也会变
-  // MySQL KEY info of this index
-  // KEY *key_info;
-
   // upsdb
   ups_db_t *db;
-  // 这是Table里面的第几个Key
+  // 这是 Table 里面的第几个 Key
   int key_index;
   // 键的类型
   uint8 index_key_type;
-  // upscaledb key type (UPS_TYPE_UINT32 etc)
+  // upscaledb key type (UPS_TYPE_UINT32 etc.，目前版本已经不需要使用这个属性了)
   uint32_t key_type;
+
 
   int keys_per_page() {
     // todo 使用 ups_db_get_parameters()
@@ -56,21 +53,18 @@ struct Index {
   }
 };
 
-// 保存一个MySQL的Table，一个Table下有多个Index
+// 保存一个 MySQ L的Table，一个 Table 下有多个 Index
 struct Table {
   explicit Table(std::string name_) : name(std::move(name_)) {}
 
   // table name, ./{db_name}/{table_name}
   std::string name;
 
-  // 一个Mysql Table有多个Index，每个Index对应一个upsDB的db
+  // 一个 Mysql Table 有多个 Index，每个 Index 对应一个 upsDB 的 db
   std::vector<Index> indices;
 
   // next value for hidden key
   std::atomic<uint64> hidden_index_value{0};
-
-  // 表中元素总数
-  // std::atomic<uint32_t> records_num{0};
 };
 
 class EnvManager;
@@ -79,37 +73,35 @@ class EnvManager;
 class DBNameTracker {
  public:
   /**
-   * 创建一个至多能追踪size个dbname的tracker
+   * 创建一个至多能追踪 size 个 dbname 的 tracker
    */
   explicit DBNameTracker(uint16_t size);
 
-  // 重置tracker，将所有dbname设置为free
+  // 重置 tracker，将所有 dbname 设置为 free
   void reset();
 
-  // 将names中的dbname设置为used，names的长度为length
-  // void assign(uint16_t *names, uint32_t length);
-
-  // 分配一个新的dbname，并将其设置为used，返回0代表没有更多的dbname可用了
+  // 分配一个新的 dbname，并将其设置为 used，返回 0 代表没有更多的 dbname 可用了
   uint16_t get_new_dbname();
 
-  // 将一个dbname设置为free
+  // 将一个 dbname 设置为 free
   void free_dbname(uint16_t dbname);
 
  private:
-  // 将 db_name 标记为已使用
   friend class EnvManager;
+  // 将 db_name 标记为已使用
   void set_used(uint16_t db_name);
 
  private:
   std::vector<bool> name_track;
 };
 
-// 管理整个UpsDB的Environment
+// 管理整个 UpsDB 的 Environment，全局只有一个 UpsDB Environment
+// todo 换成每个 MySQL Database 一个 UpsDB Environment
 class EnvManager {
  public:
   /**
-   * @param env_ 被管理的env
-   * @param max_database env中最多允许的database数（是upsdb的database数）
+   * @param env_ 被管理的 env
+   * @param max_database env 中最多允许的 database 数（是 upsDB 的 database 数）
    */
   EnvManager(ups_env_t *env_, uint16_t max_database)
       : env(env_), dbName_tracker(max_database) {
@@ -138,18 +130,21 @@ class EnvManager {
     ups_env_close(env, UPS_AUTO_CLEANUP | UPS_TXN_AUTO_ABORT);
   }
 
-  // 根据Table名字，获取Table对象，该函数没有加锁，需要自己加锁
+  // 根据 Table 名字，获取 Table 对象
   std::shared_ptr<Table> get_table_from_name(const char *table_name);
 
-  // 根据名字删除Table，会同时删除相关的upsdb，把dbname加入到dbname_tracker
+  // 根据名字删除 Table，会同时删除相关的 upsDB，把 dbname 加入到 dbname_tracker
   ups_status_t free_table(const char *table_name);
 
   inline ups_env_t *get_env() { return env; }
-  inline ulonglong next_trx() { return trx_id_count++; }
+
+  // 分配一个新的 dbname
   inline uint16_t get_new_db_name() {
     std::lock_guard<std::mutex> g(lock);
     return dbName_tracker.get_new_dbname();
   }
+
+  // 将一个新 Table 加入到 Env
   inline void add_table(const char *table_name,
                         const std::shared_ptr<Table> &table) {
     std::lock_guard<std::mutex> g(lock);
@@ -168,17 +163,15 @@ class EnvManager {
 
   DBNameTracker dbName_tracker;
 
-  std::atomic<ulonglong> trx_id_count{0};
-
  private:
   static constexpr uint16_t MetaDBName = 1;
   static constexpr int BytePerIndexRecord = 11;
   ups_db_t *meta_db_;
 
-  // 将全部的表元数据刷新到env的0号db里面
+  // 将全部的表元数据刷新到 env 的 0 号 db 里面
   ups_status_t flush_all_tables();
 
-  // 从0号db里面读取出表的元数据
+  // 从 0 号 db 里面读取出表的元数据
   ups_status_t read_all_tables();
 };
 

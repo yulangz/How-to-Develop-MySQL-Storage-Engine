@@ -12,7 +12,7 @@
 #include "utils.h"
 
 /** @brief
-  Sar_share is a class that will be shared among all open handlers.
+  a class that will be shared among all open handlers.
 */
 class Sar_share : public Handler_share {
  public:
@@ -21,8 +21,16 @@ class Sar_share : public Handler_share {
   ~Sar_share() override { thr_lock_delete(&lock); }
 };
 
+class Sar_Trx {
+ public:
+  ups_txn_t *tx = nullptr;
+  const ulonglong trx_id = 0;
+  bool is_registered = false;
+  int32_t table_in_use = 0; // 帮助实现 auto commit
+};
+
 /** @brief
-  Class definition for the storage engine
+  SAR storage engine
 */
 class ha_sar : public handler {
   // THR_LOCK_DATA lock;      ///< MySQL lock
@@ -34,12 +42,7 @@ class ha_sar : public handler {
   // 现在正在使用的cursor
   ups_cursor_t *current_cursor;
   bool is_first_after_rnd_init;  // 解决 rnd_init 后第一次读的问题
-
-  // 当前正在使用的txn
-  ups_txn_t *current_tx;  // 理论上和 get_tx_from_thd(ha_thd()) 是一样的
-  ulonglong trx_id = 0;       // 当前trx的id，似乎不是必须的
-  bool is_registered;
-  int32_t table_in_use;
+  Sar_Trx sar_trx;
 
   // MySQL table lock，按照innodb里面的实现，这个是可以不需要的，暂时保留
   THR_LOCK_DATA lock_data;
@@ -115,7 +118,6 @@ class ha_sar : public handler {
                     bool all_parts MY_ATTRIBUTE((unused))) const override {
     return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE
         // TODO　HA_DO_INDEX_COND_PUSHDOWN　待支持
-        // TODO HA_ONLY_WHOLE_INDEX ?什么意思
         ;
   }
 
@@ -199,6 +201,6 @@ class ha_sar : public handler {
       enum thr_lock_type lock_type) override;  ///< required
   int analyze(THD *, HA_CHECK_OPT *) override;
 
-  ups_txn_t *get_or_create_tx(THD *thd);
+  void update_trx(THD *thd);
   int table_primary_key() {return table->s->primary_key == MAX_KEY ? 0 : table->s->primary_key; }
 };

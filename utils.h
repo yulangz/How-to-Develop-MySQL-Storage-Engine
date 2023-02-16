@@ -22,42 +22,7 @@ typedef std::vector<uint8_t> ByteVector;
 void log_error_impl(const char *file, int line, const char *function, ups_status_t st);
 #define log_error(f, s) log_error_impl(__FILE__, __LINE__, f, s)
 
-// Txn自动代理类，在析构的时候会自动abort这个txn（如果没有commit的话）
-//struct TxnProxy {
-//  explicit TxnProxy(ups_env_t *env) {
-//    ups_status_t st = ups_txn_begin(&txn, env, nullptr, nullptr, 0);
-//    if (unlikely(st != 0)) {
-//      log_error("ups_txn_begin", st);
-//      txn = nullptr;
-//    }
-//  }
-//
-//  ~TxnProxy() {
-//    if (txn != nullptr) {
-//      ups_status_t st = ups_txn_abort(txn, 0);
-//      if (unlikely(st != 0)) log_error("ups_txn_abort", st);
-//    }
-//  }
-//
-//  ups_status_t commit() {
-//    ups_status_t st = ups_txn_commit(txn, 0);
-//    if (likely(st == 0)) txn = nullptr;
-//    return st;
-//  }
-//
-//  ups_status_t abort() {
-//    if (txn != nullptr) {
-//      ups_status_t st = ups_txn_abort(txn, 0);
-//      if (likely(st == 0)) txn = nullptr;
-//      return st;
-//    }
-//    return 0;
-//  }
-//
-//  ups_txn_t *txn;
-//};
-
-// Cursor自动代理类，在析构的时候会自动关闭这个Cursor
+// Cursor 自动代理类，在析构的时候会自动关闭这个 Cursor
 struct CursorProxy {
   explicit CursorProxy(ups_cursor_t *c = nullptr) : cursor(c) {}
 

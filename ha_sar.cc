@@ -2,10 +2,8 @@
   @file ha_sar.cc
 
   @brief
-  SAR engine, 基于upscaleDB开发的Mysql Storage Engine，后续将会支持SGX。
-  在Example
-  Engine的基础上修改过来的，很多地方参考了Example、Innobase、MyRocks等其他
-  存储引擎
+  SAR engine, 基于 upscaleDB 开发的 Mysql Storage Engine。
+  在 Example Engine 的基础上修改过来的，很多地方参考了 Example、Innobase、MyRocks 等其他存储引擎
 
   @note
   以下是一次查询到示例
@@ -71,18 +69,18 @@
 static handlerton *sar_hton;
 
 // 从 thd 中获取当前连接的事务
-static ups_txn_t *get_tx_from_thd(THD *const thd) {
+static inline ups_txn_t *get_tx_from_thd(THD *const thd) {
   return reinterpret_cast<ups_txn_t *>(thd_get_ha_data(thd, sar_hton));
 }
 
 // 从 thd 中删除当前连接的事务
-static void remove_tx_in_thd(THD *const thd) {
+static inline void remove_tx_in_thd(THD *const thd) {
   thd_set_ha_data(thd, sar_hton, nullptr);
 }
 
 // 从 thd 中获取当前连接的事务，如果没有事务则创建新的事务
-ups_txn_t *ha_sar::get_or_create_tx(THD *const thd) {
-  ups_txn_t *tx = get_tx_from_thd(thd);
+void ha_sar::update_trx(THD *const thd) {
+  auto *tx = get_tx_from_thd(thd);
   if (tx == nullptr) {
     // create and start tx
     ups_status_t st;
@@ -92,13 +90,10 @@ ups_txn_t *ha_sar::get_or_create_tx(THD *const thd) {
       log_error("ups_txn_begin", st);
     }
     thd_set_ha_data(thd, sar_hton, tx);
-    //trx_id = Catalogue::env_manager->next_trx();
-    is_registered = false;
-    table_in_use = 0;
-    // sql_print_information("create trx %p", tx);
-    //sql_print_error("create trx %p", tx);
+    sar_trx.tx = tx;
+    sar_trx.is_registered = false;
+    sar_trx.table_in_use = 0;
   }
-  return tx;
 }
 
 // 返回第idx个key的key_info
@@ -137,6 +132,7 @@ static int sar_commit(handlerton *,    /*!< in/out: InnoDB handlerton */
   if (commit_trx) {
     DBUG_PRINT("commit", ("commit trx"));
     auto tx = get_tx_from_thd(thd);
+    DBUG_ASSERT(tx != nullptr);
     remove_tx_in_thd(thd);
     st = ups_txn_commit(tx, 0);
     if (st != UPS_SUCCESS) {
@@ -163,6 +159,7 @@ static int sar_rollback(handlerton *,      /*!< in/out: InnoDB handlerton */
   DBUG_PRINT("rollback", ("rollback trx with rollback_trx=%d", rollback_trx));
   if (rollback_trx) {
     auto tx = get_tx_from_thd(thd);
+    DBUG_ASSERT(tx != nullptr);
     remove_tx_in_thd(thd);
     st = ups_txn_abort(tx, 0);
     if (st != UPS_SUCCESS) {
@@ -191,7 +188,6 @@ static int sar_init_func(void *p) {
   //  flag |= UPS_CACHE_UNLIMITED;
   //  flag |= UPS_IN_MEMORY;
   //  flag |= UPS_DISABLE_MMAP;
-  // DBUG_ASSERT(params[7].name == 0 && params[7].value == 0);
   // params[0] = {UPS_PARAM_CACHESIZE, 0}; // todo set cache size，0 is for test
 
 #ifdef REMOTE
@@ -220,9 +216,6 @@ static int sar_init_func(void *p) {
   sar_hton->state = SHOW_OPTION_YES;
   sar_hton->create = sar_create_handler;
   sar_hton->flags = HTON_TEMPORARY_NOT_SUPPORTED;
-  // HTON_SUPPORTS_EXTENDED_KEYS?
-  // HTON_CAN_RECREATE?
-  // HTON_SUPPORTS_TABLE_ENCRYPTION?
 
   sar_hton->is_supported_system_table =
       sar_is_supported_system_table;  // 具体作用并不是非常清楚，保留吧
@@ -238,13 +231,6 @@ static int sar_uninstall_func(void *p __attribute__((unused))) {
   Catalogue::env_manager = nullptr;
   DBUG_RETURN(0);
 }
-
-// key是否存在于db中
-//static inline bool key_exists(ups_db_t *db, ups_key_t *key) {
-//  ups_record_t record = ups_make_record(nullptr, 0);
-//  ups_status_t st = ups_db_find(db, nullptr, key, &record, 0);
-//  return st == 0;
-//}
 
 // 删除一张Mysql表，删除upsdb中与这张表相关的全部内容，最后从env_manager内将其删除
 static ups_status_t delete_mysql_table(const char *table_name) {
@@ -344,11 +330,6 @@ static ups_status_t create_mysql_table(const char *table_name, TABLE *table) {
 }
 
 /**
-  @brief
-  Example of simple lock controls. The "share" it creates is a
-  structure we will pass to each sar handler. Do you have to have
-  one of these? Well, you have pieces that are used for locking, and
-  they are needed to function.
   copy from example engine
 */
 Sar_share *ha_sar::get_share() {
@@ -376,8 +357,7 @@ err:
      { (const char*)NULL, (const char*)NULL }
 
   This array is optional, so every SE need not implement it.
-  我们的存储引擎只有一个文件，保存在大data目录下，（远程版本连这个文件都没有）
-  所以下面为空
+  我们的存储引擎只有一个文件，保存在大 data 目录下，所以下面为空
 */
 static st_handler_tablename ha_sar_system_tables[] = {
     {(const char *)nullptr, (const char *)nullptr}};
@@ -393,7 +373,7 @@ static st_handler_tablename ha_sar_system_tables[] = {
   @return
     @retval true   Given db.table_name is supported system table.
     @retval false  Given db.table_name is not a supported system table.
-  @note 直接用的Example Engine里面的实现
+  @note 直接用的 Example Engine 里面的实现
 */
 static bool sar_is_supported_system_table(const char *db,
                                           const char *table_name,
@@ -517,14 +497,14 @@ int ha_sar::close() {
 }
 
 /**
- * 根据primary key插入一条record（一个mysql row）
+ * 根据 primary key 插入一条 record（一个 mysql row）
  * @param catidx primary key的Index信息
- * @param table 所属的mysql Table信息
+ * @param table 所属的 mysql Table信息
  * @param buf mysql row buf
- * @param txn 所属于的事务，null表示不使用事务
+ * @param txn 所属于的事务，null 表示不使用事务
  * @param key_arena primary key buffer
  * @param record_arena record buffer
- * @return 0成功，否则失败
+ * @return 0 成功，否则失败
  */
 static inline int insert_primary_key(Catalogue::Table &cattbl,
                                      Catalogue::Index &catidx, TABLE *table,
@@ -545,8 +525,8 @@ static inline int insert_primary_key(Catalogue::Table &cattbl,
 }
 
 /**
- * 插入一个secondary index
- * @param table 所属的mysql Table信息
+ * 插入一个 secondary index
+ * @param table 所属的 mysql Table 信息
  * @param catidx secondary key的Index信息
  * @param buf mysql row buf
  * @param txn 所属于的事务，null表示不使用事务
@@ -581,7 +561,7 @@ static inline int insert_secondary_key(Catalogue::Table &cattbl, TABLE *table,
 }
 
 /**
- * 插入一条Mysql行，会把primary index和secondary index都写好，txn用来保证原子性
+ * 插入一条 Mysql 行，会把 primary index 和 secondary index 都写好，txn 用来保证原子性
  * @param cattbl 所属的Table
  * @param table 所属的mysql Table信息
  * @param buf mysql row buf
@@ -612,7 +592,8 @@ static inline int insert_multiple_indices(Catalogue::Table *cattbl,
   return 0;
 }
 
-// 找到secondary_index中指向对应位置的cursor，其中record的值必须为primary_record
+// 回表
+// 找到 secondary_index 中指向对应位置的 cursor，其中 record 的值必须为 primary_record
 static inline ups_cursor_t *locate_secondary_key(ups_db_t *db, ups_txn_t *txn,
                                                  ups_key_t *key,
                                                  ups_record_t *primary_record) {
@@ -643,7 +624,7 @@ static inline ups_cursor_t *locate_secondary_key(ups_db_t *db, ups_txn_t *txn,
   return cp.detach();
 }
 
-// 删除secondary_index中的一条记录，其中primary_key是记录的值
+// 删除 secondary_index 中的一条记录，其中 primary_key 是记录的值
 static inline int delete_from_secondary(Catalogue::Table &cattbl, TABLE *table,
                                         ups_db_t *db, KEY *key_info,
                                         const uint8_t *buf, ups_txn_t *txn,
@@ -664,14 +645,11 @@ static inline int delete_from_secondary(Catalogue::Table &cattbl, TABLE *table,
   return 0;
 }
 
-// 删除一个Mysql的row记录，以及与它相关的secondary_index
+// 删除一个 Mysql 的 row，以及与它相关的 secondary_index
 static int delete_multiple_indices(TABLE *table, Catalogue::Table *cattbl,
                                    const uint8_t *buf, ByteVector &key_arena,
                                    ups_txn_t *tx) {
   ups_status_t st;
-
-  // TxnProxy txnp(Catalogue::env_manager->env);
-  // if (unlikely(!txnp.txn)) return 1;
 
   // 提取出 primary key
   ups_key_t primary_key;
@@ -703,13 +681,12 @@ static int delete_multiple_indices(TABLE *table, Catalogue::Table *cattbl,
     }
   }
 
-  // st = txnp.commit();
   if (unlikely(st != 0)) return 1;
 
   return 0;
 }
 
-// 判断两个ups key是否相等
+// 判断两个 ups key 是否相等
 static inline bool are_keys_equal(ups_key_t *lhs, ups_key_t *rhs) {
   if (lhs->size != rhs->size) return false;
   return 0 == ::memcmp(lhs->data, rhs->data, lhs->size);
@@ -752,12 +729,11 @@ static inline int ups_status_to_error(TABLE *table, const char *msg,
 */
 
 int ha_sar::write_row(uchar *buf) {
-  // table->s->reclength是一行（一个record）的最大长度，也就是说对于varchar等
+  // table->s->reclength 是一行（一个record）的最大长度，也就是说对于 varchar 等
   // 变长类型，会是其最长长度（而不是实际长度），直接用会有空间浪费，所以才需要自行提取
   DBUG_ENTER("ha_sar::write_row");
-  // duplicate_error_index = (uint32_t)-1;
   DBUG_ASSERT(!current_table->indices.empty());
-
+  DBUG_ASSERT(get_tx_from_thd(ha_thd()) == sar_trx.tx);
   /*
   Note: "buf == table->record[0]" is copied from innodb. I am not aware of
   any use cases where this condition is not true.
@@ -772,15 +748,12 @@ int ha_sar::write_row(uchar *buf) {
   // only one index? do not need transaction
   if (current_table->indices.size() == 1) {
     int rc = insert_primary_key(*current_table, current_table->indices[0],
-                                table, buf, current_tx, key_arena, record_arena);
-    // if (unlikely(rc == HA_ERR_FOUND_DUPP_KEY)) duplicate_error_index = 0;
+                                table, buf, sar_trx.tx, key_arena, record_arena);
     DBUG_RETURN(rc);
   }
-  DBUG_ASSERT(get_tx_from_thd(ha_thd()) == current_tx);
-  int rc = insert_multiple_indices(current_table.get(), table, buf, current_tx,
-                                   key_arena, record_arena);
+
+  int rc = insert_multiple_indices(current_table.get(), table, buf, sar_trx.tx,key_arena, record_arena);
   if (unlikely(rc)) DBUG_RETURN(rc);
-  //++current_table->records_num;
   DBUG_RETURN(0);
 }
 
@@ -800,9 +773,9 @@ int ha_sar::write_row(uchar *buf) {
 int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
   DBUG_ENTER("ha_sar::update_row");
 
+  DBUG_ASSERT(get_tx_from_thd(ha_thd()) == sar_trx.tx);
   ups_status_t st;
   ups_record_t new_rec = record_from_row(table, new_buf, record_arena);
-  ups_txn_t *tx = current_tx;
 
   DBUG_ASSERT(!current_table->indices.empty());
 
@@ -823,7 +796,7 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
     // if both keys are equal: simply overwrite the record of the
     // current key
     if (equal) {
-      st = ups_db_insert(current_table->indices[0].db, tx, &oldkey, &new_rec,
+      st = ups_db_insert(current_table->indices[0].db, sar_trx.tx, &oldkey, &new_rec,
                          UPS_OVERWRITE);
       if (unlikely(st != 0)) {
         log_error("ups_cursor_overwrite", st);
@@ -833,13 +806,13 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
     }
 
     ups_db_t *db = current_table->indices[0].db;
-    st = ups_db_erase(db, tx, &oldkey, 0);
+    st = ups_db_erase(db, sar_trx.tx, &oldkey, 0);
     if (unlikely(st != 0)) {
       log_error("ups_db_erase", st);
       DBUG_RETURN(1);
     }
 
-    st = ups_db_insert(db, tx, &newkey, &new_rec, 0);
+    st = ups_db_insert(db, sar_trx.tx, &newkey, &new_rec, 0);
     if (unlikely(st == UPS_DUPLICATE_KEY)) DBUG_RETURN(HA_ERR_FOUND_DUPP_KEY);
     if (unlikely(st != 0)) {
       log_error("ups_db_insert", st);
@@ -871,12 +844,12 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
   // primary key
   if (changed[0]) {
     // primary key有修改，需要删除原来的主键，并插入新的主键
-    st = ups_db_erase(current_table->indices[0].db, tx, &old_primary_key, 0);
+    st = ups_db_erase(current_table->indices[0].db, sar_trx.tx, &old_primary_key, 0);
     if (unlikely(st != 0)) {
       log_error("ups_db_erase", st);
       DBUG_RETURN(1);
     }
-    st = ups_db_insert(current_table->indices[0].db, tx, &new_primary_key,
+    st = ups_db_insert(current_table->indices[0].db, sar_trx.tx, &new_primary_key,
                        &new_rec, 0);
     if (unlikely(st == UPS_DUPLICATE_KEY)) DBUG_RETURN(HA_ERR_FOUND_DUPP_KEY);
     if (unlikely(st != 0)) {
@@ -885,7 +858,7 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
     }
   } else {
     // primary key无修改，直接覆盖即可
-    st = ups_db_insert(current_table->indices[0].db, tx, &new_primary_key,
+    st = ups_db_insert(current_table->indices[0].db, sar_trx.tx, &new_primary_key,
                        &new_rec, UPS_OVERWRITE);
     if (unlikely(st != 0)) {
       log_error("ups_db_insert", st);
@@ -910,14 +883,14 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
       // secondary index有修改，删除原来的记录并插入新记录
       int rc = delete_from_secondary(
           *current_table, table, current_table->indices[i].db,
-          get_key_info(table, current_table->indices[i].key_index), old_buf, tx,
+          get_key_info(table, current_table->indices[i].key_index), old_buf, sar_trx.tx,
           &old_primary_key, old_second_k);
       if (unlikely(rc != 0)) DBUG_RETURN(rc);
       uint32_t flags = 0;
       if (key_enable_duplicates(
               get_key_info(table, current_table->indices[i].key_index)))
         flags = UPS_DUPLICATE;
-      st = ups_db_insert(current_table->indices[i].db, tx, &newkey,
+      st = ups_db_insert(current_table->indices[i].db, sar_trx.tx, &newkey,
                          &new_primary_key_record, flags);
       if (unlikely(st == UPS_DUPLICATE_KEY)) DBUG_RETURN(HA_ERR_FOUND_DUPP_KEY);
       if (unlikely(st != 0)) {
@@ -930,7 +903,7 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
           key_from_row((uchar *)old_buf,
                        get_key_info(table, current_table->indices[i].key_index),
                        table, *current_table, old_second_k);
-      CursorProxy cp(locate_secondary_key(current_table->indices[i].db, tx,
+      CursorProxy cp(locate_secondary_key(current_table->indices[i].db, sar_trx.tx,
                                           &oldkey, &old_primary_key_record));
       DBUG_ASSERT(cp.cursor != nullptr);
       st = ups_cursor_overwrite(cp.cursor, &new_primary_key_record, 0);
@@ -940,12 +913,6 @@ int ha_sar::update_row(const uchar *old_buf, uchar *new_buf) {
       }
     }
   }
-
-  //  st = txnp.commit();
-  //  if (unlikely(st != 0)) {
-  //    log_error("ups_txn_commit", st);
-  //    DBUG_RETURN(1);
-  //  }
 
   DBUG_RETURN(0);
 }
@@ -974,13 +941,14 @@ int ha_sar::delete_row(const uchar *buf) {
   DBUG_ENTER("ha_sar::delete_row");
 
   DBUG_ASSERT(!current_table->indices.empty());
+  DBUG_ASSERT(get_tx_from_thd(ha_thd()) == sar_trx.tx);
   ups_status_t st;
   // fast code path: if there's just one index
   if (current_table->indices.size() == 1) {
     ups_key_t key = key_from_row(
         buf, get_key_info(table, current_table->indices[0].key_index), table,
         *current_table, key_arena);
-    st = ups_db_erase(current_table->indices[0].db, current_tx, &key, 0);
+    st = ups_db_erase(current_table->indices[0].db, sar_trx.tx, &key, 0);
     if (unlikely(st != 0)) {
       log_error("ups_cursor_erase", st);
       DBUG_RETURN(1);
@@ -990,8 +958,7 @@ int ha_sar::delete_row(const uchar *buf) {
 
   // otherwise (if there are multiple indices) then delete the key from
   // each index
-  int rc = delete_multiple_indices(table, current_table.get(), buf, key_arena,
-                                   current_tx);
+  int rc = delete_multiple_indices(table, current_table.get(), buf, key_arena,sar_trx.tx);
   if (unlikely(rc)) DBUG_RETURN(rc);
   //--current_table->records_num;
   DBUG_RETURN(0);
@@ -1005,12 +972,11 @@ int ha_sar::index_init(uint idx, bool) {
   DBUG_ASSERT(current_cursor == nullptr);
   DBUG_ASSERT(!current_table->indices.empty());
   DBUG_ASSERT(idx < current_table->indices.size());
+  DBUG_ASSERT(get_tx_from_thd(ha_thd()) == sar_trx.tx);
 
   active_index = idx;
   ups_db_t *db = current_table->indices[idx].db;
-
-  ups_txn_t *tx = current_tx;
-  ups_status_t st = ups_cursor_create(&current_cursor, db, tx, 0);
+  ups_status_t st = ups_cursor_create(&current_cursor, db, sar_trx.tx, 0);
   if (unlikely(st != 0)) {
     log_error("ups_cursor_create", st);
     DBUG_RETURN(1);
@@ -1080,11 +1046,11 @@ int ha_sar::index_read_map(uchar *buf, const uchar *key,
   DBUG_ASSERT(active_index != MAX_KEY);
   DBUG_ASSERT(current_table != nullptr);
   DBUG_ASSERT(current_cursor != nullptr);
+  DBUG_ASSERT(get_tx_from_thd(ha_thd()) == sar_trx.tx);
   // end_range
   bool read_primary_index = (active_index == 0);
   if (read_primary_index) {
-    DBUG_ASSERT(current_table->indices[active_index].index_key_type !=
-                Catalogue::KEY_TYPE_GENERAL);
+    DBUG_ASSERT(current_table->indices[active_index].index_key_type !=  Catalogue::KEY_TYPE_GENERAL);
   }
 
   // when reading from the primary index: directly fetch record into |buf|
@@ -1141,7 +1107,7 @@ int ha_sar::index_read_map(uchar *buf, const uchar *key,
         rec.data = buf;
         rec.flags = UPS_RECORD_USER_ALLOC;
       }
-      st = ups_db_find(current_table->indices[0].db, current_tx, &key_ups, &rec,
+      st = ups_db_find(current_table->indices[0].db, sar_trx.tx, &key_ups, &rec,
                        0);
       if (likely(st == 0) && !row_is_fixed_length(table))
         rec = unpack_record(table, &rec, buf);
@@ -1159,6 +1125,7 @@ int ha_sar::index_operation(uchar *buf, uint32_t flags) {
   DBUG_ASSERT(active_index != MAX_KEY);
   DBUG_ASSERT(current_table != nullptr);
   DBUG_ASSERT(current_cursor != nullptr);
+  DBUG_ASSERT(get_tx_from_thd(ha_thd()) == sar_trx.tx);
   ups_status_t st;
 
   // when reading from the primary index: directly fetch record into |buf|
@@ -1184,7 +1151,7 @@ int ha_sar::index_operation(uchar *buf, uint32_t flags) {
       rec.data = buf;
       rec.flags = UPS_RECORD_USER_ALLOC;
     }
-    st = ups_db_find(current_table->indices[0].db, current_tx, &key, &rec, 0);
+    st = ups_db_find(current_table->indices[0].db, sar_trx.tx, &key, &rec, 0);
     if (unlikely(st != 0))
       return ups_status_to_error(table, "ups_cursor_move", st);
 
@@ -1269,6 +1236,7 @@ int ha_sar::rnd_init(bool scan) {
   DBUG_ENTER("ha_sar::rnd_init");
   ups_status_t st;
   DBUG_ASSERT(current_table != nullptr);
+  DBUG_ASSERT(get_tx_from_thd(ha_thd()) == sar_trx.tx);
 
   is_first_after_rnd_init = true;
   if (scan) {
@@ -1277,8 +1245,7 @@ int ha_sar::rnd_init(bool scan) {
       DBUG_ASSERT(active_index == MAX_KEY);
       // 用primary key作为索引
       ups_db_t *db = current_table->indices[0].db;
-      ups_txn_t *tx = current_tx;
-      st = ups_cursor_create(&current_cursor, db, tx, 0);
+      st = ups_cursor_create(&current_cursor, db, sar_trx.tx, 0);
       if (unlikely(st != 0)) {
         log_error("ups_cursor_create", st);
         DBUG_RETURN(1);
@@ -1298,8 +1265,7 @@ int ha_sar::rnd_init(bool scan) {
     DBUG_ASSERT(active_index == MAX_KEY);
 
     ups_db_t *db = current_table->indices[0].db;
-    ups_txn_t *tx = current_tx;
-    st = ups_cursor_create(&current_cursor, db, tx, 0);
+    st = ups_cursor_create(&current_cursor, db, sar_trx.tx, 0);
     if (unlikely(st != 0)) {
       log_error("ups_cursor_create", st);
       DBUG_RETURN(1);
@@ -1451,17 +1417,16 @@ int ha_sar::rnd_pos(uchar *buf, uchar *pos) {
 */
 int ha_sar::info(uint flag __attribute__((unused))) {
   DBUG_ENTER("ha_sar::info");
-  //stats.records = current_table->records_num;
+  DBUG_ASSERT(get_tx_from_thd(ha_thd()) == sar_trx.tx);
   ups_status_t st = UPS_SUCCESS;
-  auto tx = get_tx_from_thd(ha_thd());
   uint64_t c;
-  st = ups_db_count(current_table->indices[0].db,tx,0,&c);
+  st = ups_db_count(current_table->indices[0].db,sar_trx.tx,0,&c);
   if (unlikely(st != UPS_SUCCESS)) {
     log_error("ups_db_count", st);
     DBUG_RETURN(1);
   }
   stats.records = c;
-  /// if (flag & HA_STATUS_ERRKEY) errkey = duplicate_error_index;
+  // todo need more information
   DBUG_RETURN(0);
 }
 
@@ -1486,7 +1451,7 @@ ha_rows ha_sar::records_in_range(uint inx, key_range *min_key, key_range *max_ke
 Cost_estimate ha_sar::table_scan_cost() {
   double scan_pages = (double)stats.records / current_table->indices[table_primary_key()].keys_per_page() + 1;
   const double io_cost = scan_pages * table->cost_model()->page_read_cost(1.0);
-  Cost_estimate cost; // 有利于RVO（Return Value Optimization）
+  Cost_estimate cost; // 有利于 RVO（Return Value Optimization）
   cost.add_io(io_cost);
   return cost;
 }
@@ -1545,26 +1510,22 @@ int ha_sar::external_lock(THD *thd, int lock_type) {
     // 我们不支持savepoint，但还是按照这个规则来。
     // all 为 true的条件是：这个事务没有注册过，且 （非auto commit 模式 或是
     // begin语句）
-    auto tx = get_or_create_tx(ha_thd());
-    if (tx == nullptr)
-      DBUG_RETURN(1);
-    current_tx = tx;
-    bool all = !is_registered &&
-               (thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN));
+    update_trx(ha_thd());
+    bool all = !sar_trx.is_registered && (thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN));
     if (all) {
-      trans_register_ha(thd, true, this->ht, &trx_id);
+      trans_register_ha(thd, true, this->ht, &sar_trx.trx_id);
     } else {
-      trans_register_ha(thd, false, this->ht, &trx_id);
+      trans_register_ha(thd, false, this->ht, &sar_trx.trx_id);
     }
-    is_registered = true;
-    table_in_use++;
+    sar_trx.is_registered = true;
+    sar_trx.table_in_use++;
 //    DBUG_PRINT("register",
 //               ("register %llu trx to mysql with all=%d", trx_id, all));
   } else {
     auto tx = get_tx_from_thd(ha_thd());
     if (tx) {
-      table_in_use--;
-      if (table_in_use == 0 && !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN)) {
+      sar_trx.table_in_use--;
+      if (sar_trx.table_in_use == 0 && !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN)) {
         if (sar_commit(this->ht, ha_thd(), true) != 0) {
           DBUG_RETURN(1);
         }
@@ -1618,50 +1579,15 @@ int ha_sar::external_lock(THD *thd, int lock_type) {
 THR_LOCK_DATA **ha_sar::store_lock(THD *thd __attribute__((unused)),
                                    THR_LOCK_DATA **to,
                                    enum thr_lock_type lock_type) {
-  // TODO 这里用的是最基本的Mysql自带的表锁，可以参考MyRocks把他进行一定的转换，
+  // TODO 这里用的是最基本的 Mysql 自带的表锁，可以参考 MyRocks 把他进行一定的转换，
   //  用我们自己的锁
-  // store_lock是针对表的，给这张表加上Mysql表锁，锁的类型为lock_type，有好多个，
-  // 可以点进去看，级别从低到高，也可以不用他的表锁，innobase就没有用，直接把to给
-  // 返回来，也没有用lock_data，但是myrocks还是用了表锁，后面再改的时候要仔细考
-  // 虑一下
+  //  store_lock是针对表的，给这张表加上 Mysql 表锁，锁的类型为 lock_type，有好多个，
+  //  可以点进去看，级别从低到高，也可以不用他的表锁，innobase 就没有用，直接把 to 给
+  //  返回来，也没有用 lock_data，但是 myrocks 还是用了表锁
   if (lock_type != TL_IGNORE && lock_data.type == TL_UNLOCK)
     lock_data.type = lock_type;
   *to++ = &lock_data;
   return to;
-
-  //  if (lock_type != TL_IGNORE && lock_data.type == TL_UNLOCK) {
-  //    /*
-  //      Here is where we get into the guts of a row level lock.
-  //      If TL_UNLOCK is set
-  //      If we are not doing a LOCK TABLE or DISCARD/IMPORT
-  //      TABLESPACE, then allow multiple writers
-  //    */
-  //
-  //    //
-  //    这里是直接copy过来的，不要改，虽然if语句里面的这些东西我不知道是在干什么，
-  //    // 特别是thd_in_lock_tables(thd)，千万不要删
-  //    if ((lock_type >= TL_WRITE_CONCURRENT_INSERT && lock_type <= TL_WRITE)
-  //    &&
-  //        !thd_in_lock_tables(thd))
-  //      lock_type = TL_WRITE_ALLOW_WRITE;
-  //
-  //    /*
-  //      In queries of type INSERT INTO t1 SELECT ... FROM t2 ...
-  //      MySQL would use the lock TL_READ_NO_INSERT on t2, and that
-  //      would conflict with TL_WRITE_ALLOW_WRITE, blocking all inserts
-  //      to t2. Convert the lock to a normal read lock to allow
-  //      concurrent inserts to t2.
-  //    */
-  //
-  //    if (lock_type == TL_READ_NO_INSERT && !thd_in_lock_tables(thd))
-  //      lock_type = TL_READ;
-  //
-  //    lock_data.type = lock_type;
-  //  }
-  //
-  //  *to++ = &lock_data;
-  //
-  //  return to;
 }
 
 /**
@@ -1720,8 +1646,24 @@ int ha_sar::rename_table(const char *, const char *, const dd::Table *,
 struct st_mysql_storage_engine sar_storage_engine = {
     MYSQL_HANDLERTON_INTERFACE_VERSION};
 
-// Mysql MYSQL_SYSVAR 和MYSQL_THDVAR的使用示例
-// 一些配置性的内容应该用以下的方式实现
+mysql_declare_plugin(sar){
+    MYSQL_STORAGE_ENGINE_PLUGIN,
+    &sar_storage_engine,
+    "SAR",
+    "Haitao",
+    "SGX Enabled Remote storage engine",
+    PLUGIN_LICENSE_GPL,
+    sar_init_func,      /* Plugin Init */
+    nullptr,            /* Plugin check uninstall */
+    sar_uninstall_func, /* Plugin Deinit */
+    0x0001 /* 0.1 */,
+    nullptr, /* status variables */
+    nullptr, /* system variables */
+    nullptr, /* config options */
+    0,       /* flags */
+} mysql_declare_plugin_end;
+
+// Mysql MYSQL_SYSVAR 和 MYSQL_THDVAR 的使用示例，一些配置性的内容（如 Cache Size 最好通过这个方法设置）
 /*
   It's just an example of THDVAR_SET() usage below.
 */
@@ -1856,20 +1798,3 @@ struct st_mysql_storage_engine sar_storage_engine = {
 //     SHOW_SCOPE_GLOBAL},
 //     {"sar_status", (char *)show_array_sar, SHOW_ARRAY, SHOW_SCOPE_GLOBAL},
 //     {0, 0, SHOW_UNDEF, SHOW_SCOPE_UNDEF}};
-
-mysql_declare_plugin(sar){
-    MYSQL_STORAGE_ENGINE_PLUGIN,
-    &sar_storage_engine,
-    "SAR",
-    "Haitao",
-    "SGX Enabled Remote storage engine",
-    PLUGIN_LICENSE_GPL,
-    sar_init_func,      /* Plugin Init */
-    nullptr,            /* Plugin check uninstall */
-    sar_uninstall_func, /* Plugin Deinit */
-    0x0001 /* 0.1 */,
-    nullptr, /* status variables */
-    nullptr, /* system variables */
-    nullptr, /* config options */
-    0,       /* flags */
-} mysql_declare_plugin_end;

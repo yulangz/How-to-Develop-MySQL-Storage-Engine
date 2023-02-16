@@ -4,7 +4,6 @@
 
 #include "key_process.h"
 
-
 static uint32_t key_sort_length(KEY *key_info) {
   uint32_t sz = 0;
   for (uint i = 0; i < key_info->user_defined_key_parts; i++) {
@@ -20,7 +19,7 @@ static uint32_t key_sort_length(KEY *key_info) {
 
 int mysql_key_info_to_internal_key_info(KEY *mysql_key_info, uint32_t &key,
                                         uint32_t &size) {
-  // Otherwise accumulate the total size of all columns which form this key.
+  // accumulate the total size of all columns which form this key.
   key = UPS_TYPE_BINARY;
   size = 0;
   for (uint32_t i = 0; i < mysql_key_info->user_defined_key_parts; i++) {

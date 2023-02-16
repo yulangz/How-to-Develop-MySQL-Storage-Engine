@@ -11,8 +11,8 @@ EnvManager *env_manager;
 
 std::shared_ptr<Table> EnvManager::get_table_from_name(const char *table_name) {
   std::lock_guard<std::mutex> g(lock);
-  auto table_iter = Catalogue::env_manager->table_map.find(table_name);
-  if (unlikely(table_iter == Catalogue::env_manager->table_map.end())) {
+  auto table_iter = table_map.find(table_name);
+  if (unlikely(table_iter == table_map.end())) {
     return nullptr;
   }
 
@@ -65,8 +65,8 @@ ups_status_t EnvManager::flush_all_tables() {
     //   key 为 table name，value为 Table 下全部的 Index
     //     value 编码：
     //       |         ... index 1 ...        |   ... index 2 ...  | ....
-    //       |db_name|key_index|is_pk|key_type|
-    //       |2byte  |4byte    |1byte|4byte   |
+    //       |db_name|key_index|index_key_type|key_type|
+    //       |2byte  |4byte    |1byte         |4byte   |
 
     size_t index_num = table->indices.size();
     index_arena.resize(BytePerIndexRecord * index_num);
@@ -151,22 +151,6 @@ ups_status_t EnvManager::read_all_tables() {
       }
     }
 
-    // 读出表中的统计信息
-//    uqi_result_t *uqi_result = nullptr;
-//    ups_record_t record = ups_make_record(0,0);
-//    char uqi_string_buffer[40] = "COUNT($key) FROM DATABASE ";
-//    char *db_name_p = uqi_string_buffer + sizeof("COUNT($key) FROM DATABASE ") - 1;
-//    auto db_name = ups_db_get_name(new_table->indices.back().db);
-//    sprintf(db_name_p, "%u", (uint32_t)db_name);
-//    st = uqi_select(env, uqi_string_buffer, &uqi_result);
-//    if (unlikely(st != UPS_SUCCESS || !uqi_result)) {
-//      log_error("uqi_select", st);
-//      return st;
-//    }
-//    uqi_result_get_record(uqi_result, 0, &record);
-//    new_table->records_num = *(uint32_t *)record.data;
-//    uqi_result_close(uqi_result);
-
     // 插入 table map
     table_map[table_name] = new_table;
     st = ups_cursor_move(cursorProxy.cursor, &k, &r, UPS_CURSOR_NEXT);
@@ -183,12 +167,6 @@ ups_status_t EnvManager::read_all_tables() {
 DBNameTracker::DBNameTracker(uint16_t size) : name_track(size, false) {}
 
 void DBNameTracker::reset() { name_track.clear(); }
-
-//void DBNameTracker::assign(uint16_t *names, uint32_t length) {
-//  for (uint32_t i = system_db_name + 1; i < length; ++i) {
-//    name_track[names[i]] = true;
-//  }
-//}
 
 uint16_t DBNameTracker::get_new_dbname() {
   auto l = (int32_t)name_track.size();

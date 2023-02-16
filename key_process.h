@@ -13,13 +13,6 @@
 #include "catalogue.h"
 #include "utils.h"
 
-// 返回一个type类型的field的前缀长度
-// inline int length_bytes_len(uint8 type) {
-//  if (type == HA_KEYTYPE_VARTEXT1 || type == HA_KEYTYPE_VARBINARY1) return 1;
-//  if (type == HA_KEYTYPE_VARTEXT2 || type == HA_KEYTYPE_VARBINARY2) return 2;
-//  return 0;
-//}
-
 /**
  * 将 mysql key 转变为 internal 格式
  * @param key_info mysql key info
