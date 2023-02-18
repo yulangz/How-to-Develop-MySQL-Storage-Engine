@@ -85,7 +85,9 @@ static uint32_t convert_to_sort_key(uchar *to, const uchar *buf,
       to[0] = 1;
     }
   }
-  field->make_sort_key(to + store_length, field->sort_length());
+  bzero(to + store_length, field->sort_length());
+  auto used_length = field->make_sort_key(to + store_length, field->sort_length());
+  (void)used_length; // for debug
   store_length += field->sort_length();
 
   // Restore field->ptr and field->null_ptr
